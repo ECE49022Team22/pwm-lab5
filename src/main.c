@@ -17,6 +17,8 @@ const char* username = "jyasuumi";
 
 #include "stm32f0xx.h"
 #include <math.h>   // for M_PI
+#include <stdio.h>  // snprintf
+#include <stdlib.h> // strtod
 
 void nano_wait(int);
 
@@ -80,6 +82,100 @@ void setup_tim3(void) {
     // enable tim3
     TIM3->CR1 |= TIM_CR1_CEN;
 
+}
+
+//============================================================================
+// UART-controlled PWM duty cycle
+// The host sends a duty cycle in percent as a text line (e.g. "40\n") over
+// USART5 (PC12 = TX, PD2 = RX, 115200 8N1) and the STM32 sets the duty cycle
+// of PC9 (TIM3 CH4). Names are prefixed to avoid clashing with autotest.o.
+//============================================================================
+#define CMD_MAX 24
+
+void uart5_init(void) {
+    RCC->AHBENR |= RCC_AHBENR_GPIOCEN | RCC_AHBENR_GPIODEN;
+
+    // PC12 = USART5_TX, PD2 = USART5_RX, both alternate function 2
+    GPIOC->MODER &= ~GPIO_MODER_MODER12;
+    GPIOC->MODER |= GPIO_MODER_MODER12_1;
+    GPIOD->MODER &= ~GPIO_MODER_MODER2;
+    GPIOD->MODER |= GPIO_MODER_MODER2_1;
+    GPIOC->AFR[1] &= ~GPIO_AFRH_AFRH4;
+    GPIOC->AFR[1] |= 0x2 << 16;
+    GPIOD->AFR[0] &= ~GPIO_AFRL_AFRL2;
+    GPIOD->AFR[0] |= 0x2 << 8;
+
+    RCC->APB1ENR |= RCC_APB1ENR_USART5EN;
+    USART5->CR1 &= ~USART_CR1_UE;
+    USART5->CR1 &= ~(USART_CR1_M0 | USART_CR1_M1 | USART_CR1_PCE | USART_CR1_OVER8);
+    USART5->CR2 &= ~USART_CR2_STOP;
+    USART5->BRR = 0x1A1; // 48 MHz / 115200 = 417
+    USART5->CR1 |= USART_CR1_TE | USART_CR1_RE;
+    USART5->CR1 |= USART_CR1_UE;
+    while ((USART5->ISR & (USART_ISR_TEACK | USART_ISR_REACK)) != (USART_ISR_TEACK | USART_ISR_REACK))
+        ;
+}
+
+static void uart5_putc(char c) {
+    while (!(USART5->ISR & USART_ISR_TXE))
+        ;
+    USART5->TDR = c;
+}
+
+static void uart5_puts(const char *s) {
+    while (*s)
+        uart5_putc(*s++);
+}
+
+// Sets the duty cycle of PC9 (TIM3 CH4); the other channels are untouched.
+// Returns the duty (%) actually produced after rounding to a whole timer count.
+double pc9_set_duty(double pct) {
+    uint32_t period = TIM3->ARR + 1;
+    TIM3->CCR4 = (uint32_t)(period * pct / 100.0 + 0.5);
+    return 100.0 * TIM3->CCR4 / period;
+}
+
+void pwm_uart_loop(void) {
+    char line[CMD_MAX];
+    int n = 0;
+
+    for (;;) {
+        if (USART5->ISR & USART_ISR_ORE)
+            USART5->ICR = USART_ICR_ORECF;
+        if (!(USART5->ISR & USART_ISR_RXNE))
+            continue;
+
+        char c = USART5->RDR;
+        if (c != '\r' && c != '\n') {
+            if (n < CMD_MAX - 1)
+                line[n] = c;
+            n++; // keep counting so an over-long line is rejected, not truncated
+            continue;
+        }
+
+        if (n == 0)
+            continue; // blank line, or the \n of a \r\n pair
+        if (n > CMD_MAX - 1) {
+            n = 0;
+            uart5_puts("ERR line too long\r\n");
+            continue;
+        }
+        line[n] = '\0';
+        n = 0;
+
+        char *end;
+        double duty = strtod(line, &end);
+        while (*end == ' ' || *end == '\t')
+            end++;
+        if (end == line || *end != '\0' || !(duty >= 0.0 && duty <= 100.0)) {
+            uart5_puts("ERR need a number from 0 to 100 (%)\r\n");
+            continue;
+        }
+
+        char reply[48];
+        snprintf(reply, sizeof reply, "OK PC9 duty %.1f%%\r\n", pc9_set_duty(duty));
+        uart5_puts(reply);
+    }
 }
 
 void setup_tim1(void) {
@@ -446,8 +542,17 @@ int main(void) {
     // Uncomment autotest to get the confirmation code.
     // autotest();
 
+    // Uncomment only one of TEST_UART_PWM / TEST_TIMER3 (each loops forever).
+    // PC9 duty cycle set from the host over USART5 (see pwm_uart.py).
+#define TEST_UART_PWM
+#ifdef TEST_UART_PWM
+    uart5_init();
+    setup_tim3();
+    pwm_uart_loop();
+#endif
+
     // Demonstrate part 1
-#define TEST_TIMER3
+// #define TEST_TIMER3
 #ifdef TEST_TIMER3
     setup_tim3();
     for(;;) { }
