@@ -33,7 +33,7 @@ TIM2 runs in encoder mode (`SMS=011`), counting both edges of both channels
 in hardware — no ISR needed just to count pulses. TIM14 (100 Hz) drives the
 PID loop tick; speed is measured over the last 5 ticks (50 ms). There's no
 current sensing: current is bounded by the MDD20A's own limiting and the
-bench supply. The firmware adds a duty cap (40% at boot, up to 100%) and a
+bench supply. The firmware adds a duty cap (100% at boot, lower with `cap`) and a
 stall watchdog that force-stops the motor if it's pinned at the cap with
 near-zero measured speed for 500 ms.
 

@@ -266,11 +266,11 @@ void pwm_uart_loop(void) {
 //
 // Safety: there is no current sensing here. Estimated from the specs (198 RPM
 // no-load, 6.3 ft-lbf stall, 26.85:1, lossless gearbox) the RS775-125 has
-// ~0.7 ohm and ~15-20 A stall current at 12 V, so a stall at 40% duty would
-// draw ~7 A -- more than the bench supply's ~5 A limit, within the MDD20A's
-// 20 A rating. Current is bounded by the supply limit and the MDD20A's own
-// current limiting, not by the duty cap. mc_duty_cap_pct (boot default 40%) is a
-// bench-safety speed/torque limit. A software stall watchdog force-stops the
+// ~0.7 ohm and ~15-20 A stall current at 12 V, within the MDD20A's 20 A
+// rating; the bench supply's ~5 A limit caps it first. Current is bounded by
+// the supply limit and the MDD20A's own current limiting, not by the duty cap.
+// mc_duty_cap_pct boots at 100% (full speed range, ~214 RPM); lower it with
+// `cap` to limit speed/torque. A software stall watchdog force-stops the
 // motor if it asks for max output while showing ~zero speed for
 // MOTOR_STALL_TIMEOUT_MS, and every direction reversal passes through one
 // tick of zero duty (= brake on the MDD20A) before flipping DIR1.
@@ -314,7 +314,7 @@ volatile float mc_Kp = 0.066f;
 volatile float mc_Ki = 1.97f;
 volatile float mc_Kd = 0.0f;
 
-volatile float mc_duty_cap_pct = 40.0f;  // boot default for bench safety; up to MOTOR_DUTY_HARD_MAX
+volatile float mc_duty_cap_pct = 100.0f; // boot default: full range; lower with `cap`
 volatile float mc_target_rpm = 0.0f;     // set over UART, signed (+ = forward)
 volatile float mc_ramped_rpm = 0.0f;     // soft-start setpoint, updated in the ISR
 volatile float mc_measured_rpm = 0.0f;

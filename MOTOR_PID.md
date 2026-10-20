@@ -60,7 +60,7 @@ Not yet checked:
   with the 12 V off; `cnt` should change by about 752. All RPM figures rely
   on the 751.8 counts/rev from the spec.
 - **Behavior under load**: rerun `motor_autotune.py` once a load is attached.
-- The boot cap is 40% (~85 RPM). Raise it with `cap 100` for the full range.
+- The duty cap boots at 100% (full range). Lower it with `cap` for gentler bench work.
 
 ---
 
@@ -113,7 +113,7 @@ supply) are common.
 | `MOTOR_COUNTS_PER_REV` | 9600 | **751.8** | 7 × 4 × 26.85 |
 | Speed measurement | count change over 1 tick (10 ms) | **over the last 5 ticks (50 ms), updated every tick** | At 751.8 counts/rev one count per 10 ms is ~8 RPM. Over 50 ms it's ~1.6 RPM. |
 | PWM | 1 kHz (`MOTOR_PWM_PERIOD` 48000) | **20 kHz** (2400) | The MDD20A handles 20 kHz; inaudible. The 1 kHz was for the slow L298N. |
-| Duty cap boot default | 30% | **40%** | Bench-safety limit, adjustable with `cap` |
+| Duty cap boot default | 30% | **100%** | Full speed range. Was 40% for first bring-up; stall current isn't a driver risk (§5). Adjustable with `cap`. |
 | `MOTOR_DUTY_HARD_MAX` | 35% | **100%** | Old value came from the DRI0002's 2 A rating. The MDD20A limits its own current. |
 | Gains Kp / Ki | 0.6 / 3.0 | **0.066 / 1.97** | Measured and tuned by `motor_autotune.py` (§1). Started from 0.2 / 1.0. |
 | Ramp | 80 RPM/s | **200 RPM/s** | Matches the larger speed range |
@@ -210,7 +210,7 @@ once the limit lifts.
 
 ### 4.5 Applying the output
 
-- Clamped to ±`cap` (40% at boot).
+- Clamped to ±`cap` (100% at boot).
 - **Sign** → DIR1 (PB0). **Magnitude** → PWM1 duty (`TIM3->CCR1`, 0–2400).
 - **Reversals** get one 10 ms tick at zero duty before DIR1 flips. On the
   MDD20A zero duty means brake.
@@ -224,8 +224,8 @@ and the driver was rated 2 A, so the duty cap doubled as a stall-current limit.
 Estimated from AndyMark's numbers (198 RPM no-load, 6.3 ft·lbf stall, 26.85:1,
 gearbox assumed lossless), the RS775-125 has about **0.7 Ω** and a **stall
 current of roughly 15–20 A at 12 V**. These are estimates, not datasheet values.
-A stall at the 40% boot cap would draw ~7 A, more than the bench supply's ~5 A
-limit and well within the MDD20A's 20 A rating. So stall current isn't a risk
+A full stall at 12 V (~15–20 A) is within the MDD20A's 20 A rating, and the
+bench supply's ~5 A limit caps it first. So stall current isn't a risk
 to the driver; the supply limits it first. There is still no current sensor.
 
 | Layer | Role |
@@ -233,7 +233,7 @@ to the driver; the supply limits it first. There is still no current sensor.
 | **Bench supply limit (~5 A)** | Hard limit on what the system can draw. Goes away with a bigger supply. |
 | **MDD20A current limiting** | The driver limits its own output current. |
 | **Stall watchdog** | Output pinned at the cap **and** speed under 3 RPM for 500 ms → latch `FAULT:STALL`, cut PWM, zero the target. Cleared with `reset`. In simulation a jam at 30 RPM tripped it ~1.2 s after the jam. |
-| **Duty cap, 40% at boot** | Limits speed and torque for bench work (~80 RPM no-load at 40%). Not a current limit. |
+| **Duty cap, 100% at boot** | Lower it with `cap` to limit speed and torque (~2.2 RPM per % duty). Not a current limit. |
 | **Setpoint ramp** | No instant full-duty starts. |
 | **Reversal dead tick** | Never flips direction with drive applied. |
 

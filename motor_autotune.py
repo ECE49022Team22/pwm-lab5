@@ -16,7 +16,7 @@ Steps, all over the same USART5 link motor_pid_uart.py uses:
 Safety: aborts on FAULT:STALL, on speed far above target, or on speed in the
 wrong direction. Aborting sends `cap 0` (forces zero output even in a
 runaway, where `stop` would not help), then `stop`, and leaves the cap at 0;
-raise it again with `cap 40` once you've looked at what happened. Ctrl-C does
+raise it again with `cap 100` once you've looked at what happened. Ctrl-C does
 the same. Keep a hand on the 12 V supply switch anyway.
 
 The serial port can only be open in one program at a time: close
@@ -441,7 +441,7 @@ def main():
                 time.sleep(0.1)
             except serial.SerialException:
                 pass
-        print("Sent 'cap 0' and 'stop'. The cap stays at 0 until you raise it (e.g. 'cap 40').")
+        print("Sent 'cap 0' and 'stop'. The cap stays at 0 until you raise it (e.g. 'cap 100').")
     finally:
         try:
             link.ser.write(b"rate 10\n")
