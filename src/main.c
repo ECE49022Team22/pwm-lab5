@@ -247,59 +247,71 @@ void pwm_uart_loop(void) {
 //============================================================================
 // Closed-loop PID motor speed control
 //
-// Hardware: DFRobot DRI0002 (L298N-based, 2 A/channel rated) dual H-bridge,
-// channel 2 only. Motor: Pololu #2828, 150:1 gearmotor, 12 V, 64 CPR encoder
-// at the motor shaft = 9600 counts/rev at the *output* shaft (64 x 150; the
-// Pololu-specified 64 CPR already assumes full quadrature decoding -- do not
-// multiply by 4 again). No-load: 67 RPM / 200 mA. Stall (theoretical,
-// datasheet extrapolation): 5.5 A / 49 kg*cm -- real units stall well before
-// that as they heat up.
+// Hardware: Cytron MDD20A dual 20 A driver (6-30 V), channel 1 only, driven
+// sign-magnitude: PWM1 = speed, DIR1 = direction. PWM low brakes (M1A = M1B
+// = low). Accepts 3.3 V logic, PWM up to 20 kHz. No reverse-polarity
+// protection on VB+/VB-.
+// Motor: AndyMark PG27 (am-3651), RS775-125, 12 V, gear ratio 3249/121 =
+// 26.85:1, no-load 198 RPM at the output. Rear-mounted hall encoder, 7 pulses
+// per motor rev per channel, 5 V supply: 7 x 4 edges x 26.85 = 751.8 counts
+// per OUTPUT shaft rev. AndyMark notes the rear mount reverses its count
+// direction relative to a front-mounted encoder (see MOTOR_ENC_INVERT).
 //
-//   E2 (PWM/enable)  -> PA6  -> TIM3_CH1 (AF1), 1 kHz PWM (the L298N is slow;
-//                                DFRobot drives this board at Arduino's ~1 kHz)
-//   M2 (direction)   -> PB0  -> plain GPIO output (0 = forward, 1 = reverse,
-//                                per the DRI0002/L298N control table)
-//   Encoder A (yellow) -> PA15 -> TIM2_CH1 (AF2)
-//   Encoder B (white)  -> PB3  -> TIM2_CH2 (AF2)
+//   PWM1 -> PA6  -> TIM3_CH1 (AF1), 20 kHz PWM
+//   DIR1 -> PB0  -> plain GPIO output (0 = forward, 1 = reverse)
+//   Encoder A (yellow) -> PA15 -> TIM2_CH1 (AF2), 5 V tolerant
+//   Encoder B (green)  -> PB3  -> TIM2_CH2 (AF2), 5 V tolerant
 //   TIM2 runs in hardware quadrature encoder mode (SMS = 011, counts both
 //   edges of both channels), so no ISR is needed just to count pulses.
 //
-// Safety: the DRI0002 is only rated for 2 A/channel, far below the motor's
-// 5.5 A theoretical stall current, and there is no current-sense feedback
-// wired up -- duty cycle is the only lever available. mc_duty_cap_pct
-// below is the duty ceiling (never above MOTOR_DUTY_HARD_MAX regardless of
-// what's requested over UART) chosen so that even a full stall can only pull
-// roughly cap% of the theoretical 5.5 A stall current. A software stall
-// watchdog also force-stops the motor if it asks for max output while
-// showing ~zero speed for MOTOR_STALL_TIMEOUT_MS, and every direction
-// reversal passes through one tick of zero duty before flipping M2, so the
-// H-bridge is never asked to reverse a live current.
+// Safety: there is no current sensing here. With this low-resistance motor
+// the duty cap does not bound stall current the way it did on the old
+// L298N/Pololu setup (a few percent of duty on a stalled RS775 is already
+// many amps), so current is bounded by the MDD20A's own current limiting
+// and the bench supply's limit. mc_duty_cap_pct (boot default 40%) is a
+// bench-safety speed/torque limit. A software stall watchdog force-stops the
+// motor if it asks for max output while showing ~zero speed for
+// MOTOR_STALL_TIMEOUT_MS, and every direction reversal passes through one
+// tick of zero duty (= brake on the MDD20A) before flipping DIR1.
 //============================================================================
 #include <math.h> // fabsf
 
-#define MOTOR_COUNTS_PER_REV   9600.0f  // encoder counts per OUTPUT shaft rev
+#define MOTOR_COUNTS_PER_REV   751.8f   // encoder counts per OUTPUT shaft rev
 #define MOTOR_PID_HZ           100      // PID loop rate (TIM14)
 #define MOTOR_PID_DT           (1.0f / MOTOR_PID_HZ)
-#define MOTOR_RPM_PER_COUNT    (60.0f / (MOTOR_COUNTS_PER_REV * MOTOR_PID_DT))
-#define MOTOR_PWM_PERIOD       48000    // TIM3 ARR+1 -> 48 MHz / 48000 = 1 kHz
-#define MOTOR_DUTY_HARD_MAX    35.0f    // % duty; absolute ceiling, can't be
-                                         // raised over UART (~1.9 A worst case
-                                         // if stall current scales with duty)
-#define MOTOR_RAMP_RPM_PER_S   80.0f    // soft-start slew rate
+// Speed is the count change over the last MOTOR_SPEED_WINDOW ticks, updated
+// every tick. One count per 10 ms tick would be ~8 RPM; over 5 ticks (50 ms)
+// it is ~1.6 RPM.
+#define MOTOR_SPEED_WINDOW     5
+#define MOTOR_RPM_PER_COUNT    (60.0f / (MOTOR_COUNTS_PER_REV * MOTOR_SPEED_WINDOW * MOTOR_PID_DT))
+#define MOTOR_PWM_PERIOD       2400     // TIM3 ARR+1 -> 48 MHz / 2400 = 20 kHz
+#define MOTOR_DUTY_HARD_MAX    100.0f   // % duty; the MDD20A limits its own current
+#define MOTOR_RAMP_RPM_PER_S   200.0f   // soft-start slew rate
 #define MOTOR_STALL_RPM        3.0f     // "basically not moving" threshold
 #define MOTOR_STALL_TIMEOUT_MS 500
 
+// Encoder build switches.
+// MOTOR_ENC_PULLUPS: the encoder pins only tolerate 5 V with the internal
+// pull-ups off, so they're off by default. Set 1 only if the encoder turns
+// out to be open-collector (then the lines idle at 3.3 V via the pull-ups).
+// MOTOR_ENC_INVERT: set 1 if `open 20` shows negative meas (rear-mounted
+// encoder counts backwards); inverts TI1 polarity, which reverses the count.
+#define MOTOR_ENC_PULLUPS      0
+#define MOTOR_ENC_INVERT       0
+
 // Tuning starting point only -- NOT pre-tuned for your mechanical load.
+// This motor gives ~3x the RPM per % duty of the old one (198 vs 67 RPM
+// no-load), so these start at roughly a third of the old 0.6 / 3.0.
 // Bring-up procedure: start with Ki = Kd = 0, raise Kp until you see
 // sustained oscillation at your target RPM, then back Kp off to ~50-60% of
 // that value; raise Ki just enough to kill steady-state RPM error without
 // re-introducing oscillation; add a little Kd only if overshoot on step
 // changes is a problem. Retune (lower Kp especially) if you add real load.
-volatile float mc_Kp = 0.6f;
-volatile float mc_Ki = 3.0f;
+volatile float mc_Kp = 0.2f;
+volatile float mc_Ki = 1.0f;
 volatile float mc_Kd = 0.0f;
 
-volatile float mc_duty_cap_pct = 30.0f;  // runtime-adjustable, clamped to MOTOR_DUTY_HARD_MAX
+volatile float mc_duty_cap_pct = 40.0f;  // boot default for bench safety; up to MOTOR_DUTY_HARD_MAX
 volatile float mc_target_rpm = 0.0f;     // set over UART, signed (+ = forward)
 volatile float mc_ramped_rpm = 0.0f;     // soft-start setpoint, updated in the ISR
 volatile float mc_measured_rpm = 0.0f;
@@ -317,8 +329,9 @@ volatile int   mc_open_ms_left = 0;
 
 static float mc_integral = 0.0f;
 static float mc_prev_error = 0.0f;
-static int32_t mc_last_count = 0;
-static int mc_forward = 1;               // direction currently applied to M2
+static int32_t mc_count_hist[MOTOR_SPEED_WINDOW]; // TIM2->CNT at each of the last WINDOW ticks
+static int mc_hist_i = 0;                // slot written MOTOR_SPEED_WINDOW ticks ago
+static int mc_forward = 1;               // direction currently applied to DIR1
 static uint32_t mc_stall_ms = 0;
 static int mc_tick = 0;
 
@@ -332,7 +345,7 @@ void setup_motor_pwm(void) {
     GPIOA->AFR[0] |= 0x1 << (6 * 4);         // AF1 = TIM3_CH1
 
     TIM3->PSC = 0;
-    TIM3->ARR = MOTOR_PWM_PERIOD - 1;        // 48 MHz / 48000 = 1 kHz (fits TIM3's 16 bits)
+    TIM3->ARR = MOTOR_PWM_PERIOD - 1;        // 48 MHz / 2400 = 20 kHz
     TIM3->CR1 &= ~TIM_CR1_DIR;
 
     TIM3->CCMR1 &= ~TIM_CCMR1_OC1M_0;
@@ -355,33 +368,41 @@ void setup_encoder(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
     RCC->AHBENR |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_GPIOBEN;
 
-    // PA15 = TIM2_CH1 (AF2), PB3 = TIM2_CH2 (AF2); weak pull-ups as a
-    // defensive default in case the encoder board doesn't supply its own.
+    // PA15 = TIM2_CH1 (AF2), PB3 = TIM2_CH2 (AF2). Pull-ups off unless
+    // MOTOR_ENC_PULLUPS: the 5 V encoder drives these pins directly.
     GPIOA->MODER &= ~GPIO_MODER_MODER15;
     GPIOA->MODER |= GPIO_MODER_MODER15_1;
     GPIOA->PUPDR &= ~GPIO_PUPDR_PUPDR15;
+#if MOTOR_ENC_PULLUPS
     GPIOA->PUPDR |= GPIO_PUPDR_PUPDR15_0;
+#endif
     GPIOA->AFR[1] &= ~GPIO_AFRH_AFRH7;
     GPIOA->AFR[1] |= 0x2 << 28;              // AF2, pin15 = AFR[1] nibble 7
 
     GPIOB->MODER &= ~GPIO_MODER_MODER3;
     GPIOB->MODER |= GPIO_MODER_MODER3_1;
     GPIOB->PUPDR &= ~GPIO_PUPDR_PUPDR3;
+#if MOTOR_ENC_PULLUPS
     GPIOB->PUPDR |= GPIO_PUPDR_PUPDR3_0;
+#endif
     GPIOB->AFR[0] &= ~GPIO_AFRL_AFRL3;
     GPIOB->AFR[0] |= 0x2 << 12;              // AF2, pin3 = AFR[0] nibble 3
 
     TIM2->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
     TIM2->CCMR1 |= TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0; // map CH1/CH2 to TI1/TI2
     TIM2->CCMR1 |= (0x3 << 4) | (0x3 << 12);            // light input filter on both
-    TIM2->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);     // non-inverted; flip if
-                                                          // measured direction is backwards
+    TIM2->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);     // non-inverted
+#if MOTOR_ENC_INVERT
+    TIM2->CCER |= TIM_CCER_CC1P;                         // invert TI1 -> count runs backwards
+#endif
     TIM2->SMCR &= ~TIM_SMCR_SMS;
     TIM2->SMCR |= TIM_SMCR_SMS_1 | TIM_SMCR_SMS_0;      // encoder mode 3 (both edges, both ch)
     TIM2->ARR = 0xFFFFFFFF;
     TIM2->CNT = 0;
     TIM2->CR1 |= TIM_CR1_CEN;
-    mc_last_count = 0;
+    for (int i = 0; i < MOTOR_SPEED_WINDOW; i++)
+        mc_count_hist[i] = 0;
+    mc_hist_i = 0;
 }
 
 void init_motor_pid_timer(void) {
@@ -403,10 +424,12 @@ void setup_motor_control(void) {
 void TIM14_IRQHandler(void) {
     TIM14->SR &= ~TIM_SR_UIF;
 
-    // --- measure speed from the encoder ---
+    // --- measure speed from the encoder, over the last MOTOR_SPEED_WINDOW ticks ---
     int32_t count = (int32_t)TIM2->CNT;
-    int32_t delta = count - mc_last_count;
-    mc_last_count = count;
+    int32_t delta = count - mc_count_hist[mc_hist_i];
+    mc_count_hist[mc_hist_i] = count;
+    if (++mc_hist_i >= MOTOR_SPEED_WINDOW)
+        mc_hist_i = 0;
     mc_measured_rpm = delta * MOTOR_RPM_PER_COUNT;
 
     // --- soft-start: slew the working setpoint toward the commanded one ---
@@ -979,8 +1002,8 @@ int main(void) {
     // Uncomment only one of MOTOR_PID_DEMO / TEST_UART_PWM / TEST_TIMER3
     // (each loops forever).
 
-    // Closed-loop PID speed control of the Pololu #2828 gearmotor through
-    // the DRI0002 H-bridge (E2=PA6, M2=PB0) with encoder feedback
+    // Closed-loop PID speed control of the AndyMark PG27 gearmotor through
+    // the Cytron MDD20A, channel 1 (PWM1=PA6, DIR1=PB0) with encoder feedback
     // (A=PA15, B=PB3). Host interface over USART5, see motor_pid_uart.py.
 #define MOTOR_PID_DEMO
 #ifdef MOTOR_PID_DEMO

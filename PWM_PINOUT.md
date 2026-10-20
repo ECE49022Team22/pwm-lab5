@@ -14,29 +14,28 @@ are also 48 MHz** — there's no ×2 timer-clock multiplier to account for.
 
 `main()` currently builds with `MOTOR_PID_DEMO` defined (this superseded the
 `TEST_UART_PWM` demo described below as the active path — that demo's code
-is untouched and still selectable). Closed-loop speed control of a Pololu
-#2828 150:1 gearmotor (12 V, 64 CPR encoder = 9600 counts/rev at the output
-shaft) through a DRI0002 (L298N-based) H-bridge, channel 2. Status, PID
-theory and usage are in [MOTOR_PID.md](MOTOR_PID.md); design
-notes, safety rationale, and the PID/stall-watchdog algorithm are documented
-in the comment block above `setup_motor_pwm()` in `src/main.c`. Host
-interface: `motor_pid_uart.py` (target RPM, `cap <pct>`, `reset`, `stop`),
+is untouched and still selectable). Closed-loop speed control of an
+AndyMark PG27 gearmotor (26.85:1, 751.8 encoder counts per output rev,
+198 RPM no-load) through a Cytron MDD20A driver, channel 1. Status, PID
+theory and usage are in [MOTOR_PID.md](MOTOR_PID.md); design notes are in the
+comment block above `setup_motor_pwm()` in `src/main.c`. Host interface:
+`motor_pid_uart.py` (target RPM, `open <pct>`, `cap <pct>`, `reset`, `stop`),
 same USART5 link as the PC9 demo below.
 
 | Signal | Pin | AF | Role |
 |---|---|---|---|
-| E2 (PWM/enable) | PA6 | AF1 (TIM3_CH1) | 1 kHz PWM, duty = speed magnitude |
-| M2 (direction) | PB0 | — (plain GPIO out) | 0 = forward, 1 = reverse |
-| Encoder A (yellow) | PA15 | AF2 (TIM2_CH1) | hardware quadrature decode |
-| Encoder B (white) | PB3 | AF2 (TIM2_CH2) | hardware quadrature decode |
+| MDD20A PWM1 | PA6 | AF1 (TIM3_CH1) | 20 kHz PWM, duty = speed magnitude |
+| MDD20A DIR1 | PB0 | — (plain GPIO out) | 0 = forward, 1 = reverse |
+| Encoder A (yellow) | PA15 | AF2 (TIM2_CH1) | hardware quadrature decode, 5 V tolerant, no pull-up |
+| Encoder B (green) | PB3 | AF2 (TIM2_CH2) | hardware quadrature decode, 5 V tolerant, no pull-up |
 
 TIM2 runs in encoder mode (`SMS=011`), counting both edges of both channels
 in hardware — no ISR needed just to count pulses. TIM14 (100 Hz) drives the
-PID loop tick. **DRI0002 is only rated 2 A/channel**, well below the motor's
-5.5 A theoretical stall current, and there's no current-sense feedback — the
-firmware's only lever is a duty-cycle cap (`MOTOR_DUTY_HARD_MAX` = 35%,
-hard-coded ceiling) plus a software stall watchdog that force-stops the
-motor if it's pinned at the cap with near-zero measured speed for 500 ms.
+PID loop tick; speed is measured over the last 5 ticks (50 ms). There's no
+current sensing: current is bounded by the MDD20A's own limiting and the
+bench supply. The firmware adds a duty cap (40% at boot, up to 100%) and a
+stall watchdog that force-stops the motor if it's pinned at the cap with
+near-zero measured speed for 500 ms.
 
 ## Earlier demo: UART-controlled PWM on PC9
 
