@@ -197,10 +197,14 @@ once the limit lifts.
 
 ## 5. Safety design
 
-**What changed.** On the old setup the motor's resistance was high (~2.2 Ω), so
-the duty cap also capped stall current. The RS775 is a much lower-resistance
-motor: a few percent of duty on a stalled shaft is already many amps. **The
-duty cap no longer bounds current.** There is still no current sensor.
+**What changed.** On the old setup the motor's resistance was high (~2.2 Ω)
+and the driver was rated 2 A, so the duty cap doubled as a stall-current limit.
+Estimated from AndyMark's numbers (198 RPM no-load, 6.3 ft·lbf stall, 26.85:1,
+gearbox assumed lossless), the RS775-125 has about **0.7 Ω** and a **stall
+current of roughly 15–20 A at 12 V**. These are estimates, not datasheet values.
+A stall at the 40% boot cap would draw ~7 A, more than the bench supply's ~5 A
+limit and well within the MDD20A's 20 A rating. So stall current isn't a risk
+to the driver; the supply limits it first. There is still no current sensor.
 
 | Layer | Role |
 |---|---|

@@ -264,11 +264,12 @@ void pwm_uart_loop(void) {
 //   TIM2 runs in hardware quadrature encoder mode (SMS = 011, counts both
 //   edges of both channels), so no ISR is needed just to count pulses.
 //
-// Safety: there is no current sensing here. With this low-resistance motor
-// the duty cap does not bound stall current the way it did on the old
-// L298N/Pololu setup (a few percent of duty on a stalled RS775 is already
-// many amps), so current is bounded by the MDD20A's own current limiting
-// and the bench supply's limit. mc_duty_cap_pct (boot default 40%) is a
+// Safety: there is no current sensing here. Estimated from the specs (198 RPM
+// no-load, 6.3 ft-lbf stall, 26.85:1, lossless gearbox) the RS775-125 has
+// ~0.7 ohm and ~15-20 A stall current at 12 V, so a stall at 40% duty would
+// draw ~7 A -- more than the bench supply's ~5 A limit, within the MDD20A's
+// 20 A rating. Current is bounded by the supply limit and the MDD20A's own
+// current limiting, not by the duty cap. mc_duty_cap_pct (boot default 40%) is a
 // bench-safety speed/torque limit. A software stall watchdog force-stops the
 // motor if it asks for max output while showing ~zero speed for
 // MOTOR_STALL_TIMEOUT_MS, and every direction reversal passes through one
@@ -474,7 +475,8 @@ void TIM14_IRQHandler(void) {
     // Target 0 means off once the ramp has reached it. Otherwise the integral
     // keeps whatever it built up while the motor slowed and, with no error left
     // to unwind it, holds a few % of duty into a stopped motor indefinitely --
-    // too little to turn it, but amps through a low-resistance RS775.
+    // too little to turn it, but a steady current through the stalled motor
+    // (~0.8 A at the 4.6% seen during tuning, at an estimated ~0.7 ohm).
     if (!open_loop && mc_target_rpm == 0.0f && mc_ramped_rpm == 0.0f) {
         output = 0.0f;
         mc_integral = 0.0f;
