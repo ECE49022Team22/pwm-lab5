@@ -12,33 +12,55 @@ control"); the host console is `motor_pid_uart.py`.
 
 ## 1. Current status
 
-**Running and tuned on the new hardware (unloaded).** `motor_autotune.py`
-measured the motor and picked the gains, which are now the boot defaults.
+**Running and calibrated across the full speed range (unloaded, 12 V).**
+Boot gains Kp 0.066 / Ki 1.97 came from `motor_autotune.py` and were
+re-confirmed by a full-range run (a model fitted at 30%/70% duty gave
+0.068 / 1.99).
 
-Measured (open-loop duty steps, no load, 12 V):
+### Open-loop speed vs duty
 
-| Quantity | Value |
-|---|---|
-| Speed vs duty | 2.21 RPM per % duty above ~4.1% duty |
-| Delay | ~30 ms (includes the 50 ms speed window) |
-| Time constant | ~34 ms |
-| ±20% duty | +34.4 / −35.1 RPM (symmetric) |
+| Duty | Forward RPM | Reverse RPM |
+|---|---|---|
+| 10% | 12.7 | −14.2 |
+| 20% | 34.9 | −36.2 |
+| 30% | 56.8 | −58.3 |
+| 40% | 78.9 | −80.5 |
+| 50% | 101.2 | −102.6 |
+| 60% | 123.4 | −124.6 |
+| 70% | 145.6 | −146.6 |
+| 80% | 168.1 | −168.7 |
+| 90% | 189.8 | −191.0 |
+| **100%** | **214.0** | **−215.1** |
 
-Closed-loop verification with Kp 0.066, Ki 1.97:
+- **Max speed 214 RPM forward, 215 reverse** (AndyMark spec: 198).
+- Linear at **~2.21 RPM per % duty** from 10% to 90%, above a ~3–4% duty
+  deadband. Forward and reverse within ~1.5 RPM of each other.
+- The ~5 A supply limit didn't visibly flatten the curve.
+- Response: ~25–30 ms delay (includes the 50 ms speed window), ~34 ms time
+  constant, the same at 15%, 30% and 70% duty.
 
-| Step | Overshoot | Settle (±5% + 2 RPM) | Steady error | Jitter (sd) | Duty |
+### Closed-loop verification (Kp 0.066, Ki 1.97, cap 100%)
+
+| Step | Overshoot | Settle (after the 200 RPM/s ramp) | Steady error | Jitter (sd) | Duty |
 |---|---|---|---|---|---|
-| 0 → 30 RPM | 1.0% | 0.68 s | −0.1 RPM | 0.7 RPM | 17.7% |
-| 30 → 60 RPM | 2.3% | 0.48 s | −0.1 RPM | 0.8 RPM | 31.4% |
-| 60 → −30 RPM | 0.3% | 1.10 s | −0.1 RPM | 0.5 RPM | −17.5% |
-| −30 → 0 RPM | 0% | 0.66 s | 0 | 0 | — |
+| 0 → 10 | 1.2 RPM (< one count) | 0.35 s | 0 | 0.7 RPM | 7.9% |
+| 10 → 60 | 1.4% | 0.39 s | 0 | 0.8 RPM | 30.4% |
+| 60 → 120 | 2.2% | 0.30 s | −0.1 | 0.6 RPM | 57.3% |
+| 120 → 190 | 2.1% | 0.23 s | +0.1 | 0.6 RPM | 88.5% |
+| 190 → −190 | 0.4% | 0.28 s | +0.1 | 0.4 RPM | −89.0% |
+| −190 → −60 | 0.7% | 0.51 s | 0 | 0.8 RPM | −30.4% |
+| −60 → 0 | 0 | 0.06 s | 0 | 0 | 0 |
+
+So the loop regulates from 10 RPM to 190 RPM in both directions. 190 RPM
+needs ~89% duty; above ~200 RPM there's no duty headroom left to correct
+with, so treat **~190–200 RPM as the closed-loop maximum**.
 
 Not yet checked:
 - **Encoder scale by hand**: turn the output shaft exactly one revolution
-  with the 12 V off; `cnt` should change by about 752. All RPM figures above
-  rely on the 751.8 counts/rev from the spec.
+  with the 12 V off; `cnt` should change by about 752. All RPM figures rely
+  on the 751.8 counts/rev from the spec.
 - **Behavior under load**: rerun `motor_autotune.py` once a load is attached.
-- With the 40% cap, top speed is about (40 − 4.1) × 2.21 ≈ 79 RPM.
+- The boot cap is 40% (~85 RPM). Raise it with `cap 100` for the full range.
 
 ---
 
@@ -318,7 +340,8 @@ python3 motor_autotune.py
 2. Open-loop duty steps (15%, 30%) fitted to a first-order-plus-delay model.
 3. SIMC PI gains from the model (`--tau-c`, default 0.2 s, sets how fast).
 4. Closed-loop steps 30 → 60 → −30 → 0 RPM, scored; gains scaled ×0.7 if a
-   step overshoots >10%, ×1.3 if settling is slower than 1.2 s, up to 3 rounds.
+   step overshoots >10% (ignoring overshoot under ~one count), ×1.3 if it
+   settles more than 1.0 s after the setpoint ramp ends, up to 3 rounds.
 
 It aborts on a stall fault, speed far above target, or the wrong direction,
 by sending `cap 0` then `stop` (leaving the cap at 0). Gains it finds are

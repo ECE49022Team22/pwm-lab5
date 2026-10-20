@@ -300,7 +300,9 @@ def score(rows, start, target, t_cmd):
     sd = math.sqrt(mean([(v - mean(tail)) ** 2 for v in tail]))
     return {
         "target": target, "overshoot_pct": 100 * over / abs(step) if step else 0.0,
-        "settle_s": settle, "err": mean(tail) - target, "jitter_sd": sd,
+        "overshoot_rpm": over, "settle_s": settle,
+        # the setpoint ramp alone takes |step| / RAMP_RPM_PER_S; judge settling after it
+        "settle_after_ramp_s": None if settle is None else max(0.0, settle - abs(step) / RAMP_RPM_PER_S), "err": mean(tail) - target, "jitter_sd": sd,
         "duty": mean(duty_tail), "cap": rows[-1]["cap"],
     }
 
@@ -318,9 +320,10 @@ def verify(link, targets, hold):
         rows = [r for r in rows if r["t"] >= t_cmd]
         s = score(rows, prev, tgt, t_cmd)
         results.append(s)
-        settle = f"{s['settle_s']:.2f} s" if s["settle_s"] is not None else "not settled"
+        settle = (f"{s['settle_s']:.2f} s ({s['settle_after_ramp_s']:.2f} after ramp)"
+                  if s["settle_s"] is not None else "not settled")
         print(f"  {prev:+5.0f} -> {tgt:+5.0f} RPM: overshoot {s['overshoot_pct']:4.1f}%, "
-              f"settle {settle:>11}, error {s['err']:+5.1f}, jitter sd {s['jitter_sd']:.1f}, "
+              f"settle {settle:>24}, error {s['err']:+5.1f}, jitter sd {s['jitter_sd']:.1f}, "
               f"duty {s['duty']:+5.1f}%")
         prev = tgt
     link.cmd("0")
@@ -328,12 +331,20 @@ def verify(link, targets, hold):
     return results
 
 
+QUANT_RPM = 60.0 / (751.8 * 5 * 0.01)   # one count of the 50 ms speed window
+
+
 def judge(results, max_over, slow_s):
+    """Overshoot smaller than ~one count of speed resolution isn't the controller's
+    doing (a 1.2 RPM blip on a 10 RPM step reads as 12%), so it's ignored; settling
+    is timed from the end of the setpoint ramp, which the controller can't beat."""
     nonzero = [r for r in results if r["target"] != 0]
-    worst_over = max(r["overshoot_pct"] for r in nonzero)
+    worst_over = max((r["overshoot_pct"] if r["overshoot_rpm"] > 1.25 * QUANT_RPM else 0.0)
+                     for r in nonzero)
     unsettled = any(r["settle_s"] is None for r in nonzero)
     capped = any(abs(r["duty"]) >= r["cap"] - 1 for r in nonzero)
-    slowest = max((r["settle_s"] or 99) for r in nonzero)
+    slowest = max((r["settle_after_ramp_s"] if r["settle_after_ramp_s"] is not None else 99)
+                  for r in nonzero)
     if capped:
         return "capped", worst_over, slowest
     if worst_over > max_over or unsettled and worst_over > max_over / 2:
@@ -359,7 +370,8 @@ def main():
     ap.add_argument("--tau-c", type=float, default=0.2,
                     help="desired closed-loop time constant in s (smaller = more aggressive)")
     ap.add_argument("--max-overshoot", type=float, default=10.0, help="%% overshoot allowed")
-    ap.add_argument("--slow", type=float, default=1.2, help="settling time (s) counted as too slow")
+    ap.add_argument("--slow", type=float, default=1.0,
+                    help="settling time after the setpoint ramp (s) counted as too slow")
     ap.add_argument("--rounds", type=int, default=3, help="max verify/adjust rounds")
     ap.add_argument("--log", default=f"autotune_{time.strftime('%Y%m%d_%H%M%S')}.csv",
                     help="CSV log of every telemetry line ('' to disable)")
@@ -416,7 +428,7 @@ def main():
         print("\nResult")
         for kpv, kiv, verdict, over, slowest in history:
             print(f"  Kp {kpv:.3f}  Ki {kiv:.3f}: {verdict}, worst overshoot {over:.1f}%, "
-                  f"slowest settle {slowest:.2f} s")
+                  f"slowest settle after ramp {slowest:.2f} s")
         kp_f, ki_f = history[-1][0], history[-1][1]
         print(f"\nThese gains are live now and are lost on reset. To keep them, set in src/main.c:\n"
               f"  volatile float mc_Kp = {kp_f:.3f}f;\n  volatile float mc_Ki = {ki_f:.3f}f;")
