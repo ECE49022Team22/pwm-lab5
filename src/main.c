@@ -334,6 +334,12 @@ static int mc_hist_i = 0;                // slot written MOTOR_SPEED_WINDOW tick
 static int mc_forward = 1;               // direction currently applied to DIR1
 static uint32_t mc_stall_ms = 0;
 static int mc_tick = 0;
+// Telemetry rate, set with `rate <hz>` (1-50). At the default 10 Hz the line
+// format is unchanged; at any other rate a " t=<ms>" timestamp is appended so
+// a host script can time step responses without relying on USB latency.
+#define MOTOR_TEL_MAX_HZ       50
+volatile int mc_tel_div = MOTOR_PID_HZ / 10;  // PID ticks per telemetry line
+volatile uint32_t mc_ms = 0;                  // ms since the PID timer started
 
 void setup_motor_pwm(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
@@ -501,7 +507,8 @@ void TIM14_IRQHandler(void) {
         }
     }
 
-    if (++mc_tick >= (MOTOR_PID_HZ / 10)) {  // ~10 Hz telemetry
+    mc_ms += 1000 / MOTOR_PID_HZ;
+    if (++mc_tick >= mc_tel_div) {           // 10 Hz by default, see `rate`
         mc_tick = 0;
         mc_telemetry_due = 1;
     }
@@ -516,12 +523,14 @@ void TIM14_IRQHandler(void) {
 //                 MOTOR_DUTY_HARD_MAX regardless of what's asked for
 //   open <pct>    open-loop test: fixed duty (signed), PID and stall watchdog
 //                 bypassed, auto-stops after MOTOR_OPEN_LOOP_MS
+//   kp|ki|kd <v>  set a PID gain live (0-100); replies with all three
+//   rate <hz>     telemetry rate, 1-50 Hz (adds " t=<ms>" when not 10 Hz)
 //   reset         clear a latched stall fault
 //   stop          equivalent to "0", also ends an open-loop test
 void motor_uart_loop(void) {
     char line[CMD_MAX];
     int n = 0;
-    uart5_puts("Motor PID ready. Send a target RPM, 'open <pct>', 'cap <pct>', 'reset', or 'stop'.\r\n");
+    uart5_puts("Motor PID ready. Send a target RPM, 'open <pct>', 'cap <pct>', 'kp|ki|kd <v>', 'rate <hz>', 'reset', or 'stop'.\r\n");
 
     for (;;) {
         if (mc_telemetry_due) {
@@ -535,6 +544,10 @@ void motor_uart_loop(void) {
             uart5_puts(t);
             if (u5_overruns) {
                 snprintf(t, sizeof t, " ORE=%lu", (unsigned long)u5_overruns);
+                uart5_puts(t);
+            }
+            if (mc_tel_div != MOTOR_PID_HZ / 10) {
+                snprintf(t, sizeof t, " t=%lu", (unsigned long)mc_ms);
                 uart5_puts(t);
             }
             uart5_puts("\r\n");
@@ -600,6 +613,46 @@ void motor_uart_loop(void) {
             char reply[64];
             snprintf(reply, sizeof reply, "OK open-loop %.1f%% for %d ms (clamped to cap)\r\n",
                       v, MOTOR_OPEN_LOOP_MS);
+            uart5_puts(reply);
+            continue;
+        }
+        if (line[0] == 'k' && (line[1] == 'p' || line[1] == 'i' || line[1] == 'd')) {
+            char *end;
+            double v = strtod(line + 2, &end);
+            while (*end == ' ' || *end == '\t')
+                end++;
+            if (end == line + 2 || *end != '\0' || !(v >= 0.0 && v <= 100.0)) {
+                uart5_puts("ERR need 'kp|ki|kd <0-100>'\r\n");
+                continue;
+            }
+            __disable_irq();                 // don't let the PID tick see a half-applied change
+            if (line[1] == 'p') {
+                mc_Kp = (float)v;
+            } else if (line[1] == 'd') {
+                mc_Kd = (float)v;
+            } else {
+                // keep Ki*integral (the integral's share of the output) continuous,
+                // so changing Ki mid-run doesn't kick the output
+                mc_integral = (v > 0.0 && mc_Ki > 0.0f) ? mc_integral * mc_Ki / (float)v : 0.0f;
+                mc_Ki = (float)v;
+            }
+            __enable_irq();
+            char reply[64];
+            snprintf(reply, sizeof reply, "OK kp=%.4f ki=%.4f kd=%.4f\r\n",
+                      (double)mc_Kp, (double)mc_Ki, (double)mc_Kd);
+            uart5_puts(reply);
+            continue;
+        }
+        if (strncmp(line, "rate", 4) == 0) {
+            char *end;
+            long hz = strtol(line + 4, &end, 10);
+            if (end == line + 4 || hz < 1 || hz > MOTOR_TEL_MAX_HZ) {
+                uart5_puts("ERR need 'rate <1-50>'\r\n");
+                continue;
+            }
+            mc_tel_div = (int)((MOTOR_PID_HZ + hz / 2) / hz);
+            char reply[48];
+            snprintf(reply, sizeof reply, "OK rate %d Hz\r\n", MOTOR_PID_HZ / mc_tel_div);
             uart5_puts(reply);
             continue;
         }
