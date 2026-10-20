@@ -326,7 +326,7 @@ volatile int   mc_telemetry_due = 0;     // set every few ticks, printed in main
 // PID bypassed, for telling a dead drive path apart from a dead encoder. The
 // stall watchdog can't help here (a dead encoder looks like a stall), so the
 // run is time-limited instead and the duty is still clamped to the cap.
-#define MOTOR_OPEN_LOOP_MS     5000
+#define MOTOR_OPEN_LOOP_MS     15000
 volatile float mc_open_pct = 0.0f;
 volatile int   mc_open_ms_left = 0;
 

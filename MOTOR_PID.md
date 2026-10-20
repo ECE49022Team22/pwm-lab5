@@ -279,7 +279,7 @@ python3 motor_live.py        # then open http://127.0.0.1:8090 in the Pi's brows
 Holds the serial port itself (close `motor_pid_uart.py` first), switches
 telemetry to 50 Hz, and serves a page with live charts of target vs.
 measured speed and of duty, a large measured-speed readout, buttons for
-common targets, Stop, a 5 s open-loop 30% test, and a box for any command.
+common targets, Stop, a 15 s open-loop 30% test, and a box for any command.
 Hover a chart (or focus it and use the arrow keys) for a readout at that
 moment; **Pause** freezes the charts; **Table** shows recent samples.
 `?theme=dark` / `?theme=light` forces a theme. Ctrl-C sends `stop` and
@@ -291,7 +291,7 @@ puts telemetry back to 10 Hz.
 |---|---|
 | `30`, `-30`, … | Target RPM, signed (+ = forward) |
 | `0` or `stop` | Stop; also ends an open-loop test |
-| `open 20`, `open -20` | Open-loop test: fixed duty %, PID and stall watchdog off, auto-stops after 5 s |
+| `open 20`, `open -20` | Open-loop test: fixed duty %, PID and stall watchdog off, auto-stops after 15 s (send it again to extend) |
 | `cap 60` | Set the duty cap in % (0–100) |
 | `kp 0.07`, `ki 2`, `kd 0` | Set a gain live; reply lists all three. Lost on reset. |
 | `rate 50` | Telemetry 1–50 Hz; adds ` t=<ms>` when not 10 Hz |
@@ -330,7 +330,7 @@ bring-up is for.
 1. **12 V off.** Flash: `./stm.sh upload`. Start `motor_pid_uart.py`; telemetry
    should stream with `meas=0.0`.
 2. **Supply polarity**: VB+ to supply +, VB− to supply −. Then 12 V on.
-3. **`open 20`**: motor turns for 5 s and `meas` should be **positive**
+3. **`open 20`**: motor turns (up to 15 s) and `meas` should be **positive**
    (expect very roughly 30–40 RPM).
    - **Negative**: set `MOTOR_ENC_INVERT 1`, 12 V off, reflash, repeat.
    - **Stays 0 while turning**: encoder wiring/power (red 5 V, black GND,

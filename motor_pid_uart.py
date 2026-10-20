@@ -5,7 +5,7 @@ MOTOR_PID_DEMO / motor_uart_loop()).
 Type a target RPM (signed, e.g. "40" or "-40") and Enter to command speed,
 or one of:
   open <pct>  open-loop test: fixed duty in % (signed), no PID, no stall
-              watchdog, auto-stops after 5 s -- for diagnosing wiring
+              watchdog, auto-stops after 15 s -- for diagnosing wiring and demos
   cap <pct>   set the runtime duty-cycle cap in % (hard-clamped in firmware)
   reset       clear a latched stall fault
   stop        equivalent to "0", also ends an open-loop test
