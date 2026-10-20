@@ -270,6 +270,21 @@ python3 motor_pid_uart.py
 Only one program may hold `/dev/ttyUSB0`: not `./stm.sh` without arguments,
 not the GPS logger service (`sudo systemctl stop gps-logger`).
 
+### Live graph (best for demos)
+
+```
+python3 motor_live.py        # then open http://127.0.0.1:8090 in the Pi's browser
+```
+
+Holds the serial port itself (close `motor_pid_uart.py` first), switches
+telemetry to 50 Hz, and serves a page with live charts of target vs.
+measured speed and of duty, a large measured-speed readout, buttons for
+common targets, Stop, a 5 s open-loop 30% test, and a box for any command.
+Hover a chart (or focus it and use the arrow keys) for a readout at that
+moment; **Pause** freezes the charts; **Table** shows recent samples.
+`?theme=dark` / `?theme=light` forces a theme. Ctrl-C sends `stop` and
+puts telemetry back to 10 Hz.
+
 ### Commands
 
 | Command | Effect |

@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motor PID Live</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface-1: #fcfcfb; --border: rgba(11,11,11,0.10);
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7;
+    --series-meas: #2a78d6;   /* categorical slot 1 */
+    --series-tgt: #eb6834;    /* slot 2 */
+    --series-duty: #1baf7a;   /* slot 3 (sub-3:1 on light: always paired with visible value text) */
+    --critical: #d03b3b; --warning: #fab219; --good: #0ca30c;
+    --button: #efeee9; --button-hover: #e4e3dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface-1: #1a1a19; --border: rgba(255,255,255,0.10);
+      --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #898781;
+      --grid: #2c2c2a; --axis: #383835;
+      --series-meas: #3987e5; --series-tgt: #d95926; --series-duty: #199e70;
+      --button: #262624; --button-hover: #323230;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --border: rgba(255,255,255,0.10);
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #898781;
+    --grid: #2c2c2a; --axis: #383835;
+    --series-meas: #3987e5; --series-tgt: #d95926; --series-duty: #199e70;
+    --button: #262624; --button-hover: #323230;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--text-primary);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 12px 16px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .sub { color: var(--text-secondary); font-size: 13px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+           padding: 3px 10px; border-radius: 99px; border: 1px solid var(--border); color: var(--text-secondary);
+           background: var(--surface-1); }
+  .badge i { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); display: inline-block; }
+  .badge[data-state=good] i { background: var(--good); }
+  .badge[data-state=critical] i { background: var(--critical); }
+  .badge[data-state=warning] i { background: var(--warning); }
+  .badge[hidden] { display: none; }
+  main { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .tiles { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 12px; }
+  .tile, .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .tile .label { color: var(--text-secondary); font-size: 13px; }
+  .tile .value { font-size: 28px; font-weight: 600; margin-top: 2px; }
+  .tile.hero .value { font-size: 52px; line-height: 1.05; }
+  .tile .unit { font-size: 15px; font-weight: 500; color: var(--text-secondary); margin-left: 4px; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .controls .group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .controls .sep { width: 1px; height: 26px; background: var(--border); margin: 0 4px; }
+  button, select, input { font: inherit; color: var(--text-primary); }
+  button { background: var(--button); border: 1px solid var(--border); border-radius: 8px;
+           padding: 6px 12px; cursor: pointer; font-variant-numeric: tabular-nums; }
+  button:hover { background: var(--button-hover); }
+  button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-visible {
+           outline: 2px solid var(--series-meas); outline-offset: 2px; }
+  button.stop { font-weight: 700; border-color: var(--critical); }
+  button[aria-pressed=true] { background: var(--button-hover); font-weight: 600; }
+  input[type=text] { width: 150px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+           background: var(--surface-1); }
+  select { padding: 5px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-1); }
+  #reply { color: var(--text-secondary); font-size: 13px; min-height: 18px; font-family: ui-monospace, monospace; }
+  .card h2 { font-size: 13px; font-weight: 600; margin: 0 0 6px; color: var(--text-primary); }
+  .card h2 span { color: var(--text-secondary); font-weight: 400; }
+  .legend { display: flex; gap: 14px; font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend b { display: inline-block; width: 16px; height: 2px; border-radius: 1px; }
+  .chartwrap { position: relative; height: 260px; }
+  .chartwrap.small { height: 170px; }
+  canvas { width: 100%; height: 100%; display: block; }
+  #tip { position: fixed; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+         border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+         display: none; z-index: 10; min-width: 150px; }
+  #tip .t { color: var(--text-muted); margin-bottom: 4px; }
+  #tip .row { display: flex; align-items: center; gap: 8px; }
+  #tip .row b { display: inline-block; width: 12px; height: 2px; }
+  #tip .row strong { font-variant-numeric: tabular-nums; min-width: 56px; }
+  #tip .row span { color: var(--text-secondary); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th { color: var(--text-secondary); font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; }
+  #tablecard[hidden] { display: none; }
+  @media (max-width: 760px) {
+    .tiles { grid-template-columns: 1fr 1fr; }
+    .tile.hero { grid-column: 1 / -1; }
+    .tile.hero .value { font-size: 44px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Motor speed control</h1>
+  <span class="sub">PI loop on the STM32 at 100 Hz · AndyMark PG27 · Cytron MDD20A</span>
+  <span class="badge" id="b-link" data-state="critical"><i></i><span>Connecting…</span></span>
+  <span class="badge" id="b-mode" hidden data-state="warning"><i></i><span>Open-loop test</span></span>
+  <span class="badge" id="b-fault" hidden data-state="critical"><i></i><span>⚠ Stall fault: motor stopped, press Reset</span></span>
+</header>
+<main>
+  <section class="tiles" aria-label="Current values">
+    <div class="tile hero"><div class="label">Measured speed</div><div class="value"><span id="v-meas">–</span><span class="unit">RPM</span></div></div>
+    <div class="tile"><div class="label">Target speed</div><div class="value"><span id="v-tgt">–</span><span class="unit">RPM</span></div></div>
+    <div class="tile"><div class="label">Duty</div><div class="value"><span id="v-duty">–</span><span class="unit">%</span></div></div>
+    <div class="tile"><div class="label">Duty cap</div><div class="value"><span id="v-cap">–</span><span class="unit">%</span></div></div>
+  </section>
+
+  <section class="controls" aria-label="Controls">
+    <div class="group" aria-label="Target speed">
+      <button data-cmd="-190">−190</button><button data-cmd="-120">−120</button><button data-cmd="-60">−60</button>
+      <button data-cmd="30">30</button><button data-cmd="60">60</button><button data-cmd="120">120</button><button data-cmd="190">190</button>
+      <button class="stop" data-cmd="stop">Stop</button>
+    </div>
+    <div class="sep"></div>
+    <div class="group">
+      <button data-cmd="open 30" title="Fixed 30% duty for 5 s, no feedback">Open loop 30%</button>
+      <button data-cmd="reset" id="btn-reset" hidden>Reset fault</button>
+    </div>
+    <div class="sep"></div>
+    <form class="group" id="cmdform" autocomplete="off">
+      <input type="text" id="cmd" placeholder="command, e.g. 45" aria-label="Command">
+      <button type="submit">Send</button>
+    </form>
+    <div class="sep"></div>
+    <div class="group">
+      <label class="sub" for="win">Window</label>
+      <select id="win"><option value="10">10 s</option><option value="20" selected>20 s</option><option value="30">30 s</option><option value="60">60 s</option></select>
+      <button id="pause" aria-pressed="false">Pause</button>
+      <button id="tablebtn" aria-pressed="false">Table</button>
+    </div>
+  </section>
+  <div id="reply" aria-live="polite"></div>
+
+  <section class="card">
+    <h2>Speed <span>(RPM)</span></h2>
+    <div class="legend"><span><b style="background:var(--series-meas)"></b>Measured</span><span><b style="background:var(--series-tgt)"></b>Target</span></div>
+    <div class="chartwrap"><canvas id="c-speed" tabindex="0" aria-label="Speed chart: target and measured RPM over time. Arrow keys move the readout."></canvas></div>
+  </section>
+  <section class="card">
+    <h2>Duty <span>(% of 12 V applied, signed: + forward, − reverse)</span></h2>
+    <div class="chartwrap small"><canvas id="c-duty" tabindex="0" aria-label="Duty chart: applied duty over time. Arrow keys move the readout."></canvas></div>
+  </section>
+  <section class="card" id="tablecard" hidden>
+    <h2>Recent samples <span>(newest first, one row per 0.2 s)</span></h2>
+    <table><thead><tr><th>Time</th><th>Target RPM</th><th>Measured RPM</th><th>Duty %</th></tr></thead><tbody id="tbody"></tbody></table>
+  </section>
+</main>
+<div id="tip" role="status"></div>
+
+<script>
+"use strict";
+// ?theme=dark or ?theme=light forces a theme (handy for recording); default follows the OS
+{ const th = new URLSearchParams(location.search).get("theme");
+  if (th === "dark" || th === "light") document.documentElement.dataset.theme = th; }
+const $ = id => document.getElementById(id);
+const KEEP_S = 120;
+const D = { t: [], tgt: [], meas: [], duty: [], cap: [], open: [], fault: [] };
+let paused = false, pausedAt = null, hoverT = null, dirty = true, linkOk = false;
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function fmt(v, d = 1) { return v == null || Number.isNaN(v) ? "–" : (v < 0 ? "−" : "") + Math.abs(v).toFixed(d); }
+
+// ---- data stream ----------------------------------------------------------
+function connect() {
+  const es = new EventSource("/events");
+  es.onmessage = e => {
+    const p = JSON.parse(e.data);
+    if (p.reset) for (const k in D) D[k].length = 0;
+    for (const r of p.rows) {
+      const [t, tgt, meas, duty, cap, cnt, open, fault] = r;
+      D.t.push(t); D.tgt.push(tgt); D.meas.push(meas); D.duty.push(duty);
+      D.cap.push(cap); D.open.push(open); D.fault.push(fault);
+    }
+    if (D.t.length) {
+      const cut = D.t[D.t.length - 1] - KEEP_S;
+      let n = 0; while (n < D.t.length && D.t[n] < cut) n++;
+      if (n) for (const k in D) D[k].splice(0, n);
+    }
+    for (const m of p.msgs) if (!m.startsWith("OK") && !m.startsWith("ERR")) showReply(m);
+    linkOk = p.link && D.t.length > 0;
+    if (p.rows.length || p.reset) dirty = true;
+    updateStatus();
+  };
+  es.onerror = () => { linkOk = false; updateStatus(); };
+}
+
+function updateStatus() {
+  const b = $("b-link");
+  b.dataset.state = linkOk ? "good" : "critical";
+  b.querySelector("span").textContent = linkOk ? "Live · 50 Hz" : "No data from the board";
+  const i = D.t.length - 1;
+  if (i < 0) return;
+  $("v-meas").textContent = fmt(D.meas[i]);
+  $("v-tgt").textContent = D.open[i] ? "open loop" : fmt(D.tgt[i]);
+  $("v-duty").textContent = fmt(D.duty[i]);
+  $("v-cap").textContent = fmt(D.cap[i], 0);
+  $("b-mode").hidden = !D.open[i];
+  $("b-fault").hidden = !D.fault[i];
+  $("btn-reset").hidden = !D.fault[i];
+}
+
+// ---- commands ---------------------------------------------------------------
+function showReply(text) { $("reply").textContent = text; }
+async function send(cmd) {
+  showReply("→ " + cmd);
+  try {
+    const r = await fetch("/cmd", { method: "POST", body: cmd });
+    const j = await r.json();
+    showReply(`→ ${j.cmd}   ${j.reply}`);
+  } catch { showReply(`→ ${cmd}   (no response from motor_live.py)`); }
+}
+document.querySelectorAll("button[data-cmd]").forEach(b => b.addEventListener("click", () => send(b.dataset.cmd)));
+$("cmdform").addEventListener("submit", e => {
+  e.preventDefault();
+  const v = $("cmd").value.trim();
+  if (v) { send(v); $("cmd").select(); }
+});
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  pausedAt = paused && D.t.length ? D.t[D.t.length - 1] : null;
+  $("pause").setAttribute("aria-pressed", paused);
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  dirty = true;
+});
+$("tablebtn").addEventListener("click", () => {
+  const show = $("tablecard").hidden;
+  $("tablecard").hidden = !show;
+  $("tablebtn").setAttribute("aria-pressed", show);
+  dirty = true;
+});
+$("win").addEventListener("change", () => { dirty = true; });
+
+// ---- charts -------------------------------------------------------------------
+function niceStep(span, target) {
+  const raw = span / target, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (raw <= m * p) return m * p;
+  return 10 * p;
+}
+function range(seriesList, i0, i1, minSpan, clamp) {
+  // Round ticks around the data plus zero; add one more tick only when the data
+  // would sit right on the edge, so the axis doesn't overshoot (e.g. ±191 -> ±200, not ±300).
+  let lo = 0, hi = 0;
+  for (const s of seriesList) for (let i = i0; i <= i1; i++) { if (s[i] < lo) lo = s[i]; if (s[i] > hi) hi = s[i]; }
+  const step = niceStep(Math.max(hi - lo, minSpan), 6);
+  let a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step;
+  if (b - a < minSpan) b = a + Math.ceil(minSpan / step) * step;
+  const edge = 0.02 * (b - a);
+  if (hi > b - edge && hi > 0) b += step;
+  if (lo < a + edge && lo < 0) a -= step;
+  if (clamp) { a = Math.max(a, clamp[0]); b = Math.min(b, clamp[1]); }
+  return { lo: a, hi: b, step };
+}
+function lowerBound(arr, x) { let a = 0, b = arr.length; while (a < b) { const m = (a + b) >> 1; arr[m] < x ? a = m + 1 : b = m; } return a; }
+
+const PAD = { l: 52, r: 112, t: 8, b: 28 };  // r fits an end label like "−190.0 RPM"
+function setup(cv) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h, pw: w - PAD.l - PAD.r, ph: h - PAD.t - PAD.b };
+}
+
+function drawChart(cv, series, yr, tEnd, win, opts) {
+  const { ctx, w, h, pw, ph } = setup(cv);
+  const X = t => PAD.l + (t - (tEnd - win)) / win * pw;
+  const Y = v => PAD.t + (yr.hi - v) / (yr.hi - yr.lo) * ph;
+  ctx.font = "12px system-ui, -apple-system, 'Segoe UI', sans-serif";
+  ctx.textBaseline = "middle";
+  // gridlines + y ticks
+  for (let v = yr.lo; v <= yr.hi + 1e-9; v += yr.step) {
+    const y = Math.round(Y(v)) + 0.5;
+    ctx.strokeStyle = Math.abs(v) < 1e-9 ? css("--axis") : css("--grid"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(PAD.l + pw, y); ctx.stroke();
+    ctx.fillStyle = css("--text-muted"); ctx.textAlign = "right";
+    ctx.fillText((v < 0 ? "−" : "") + Math.abs(+v.toFixed(2)), PAD.l - 8, y);
+  }
+  // x ticks: seconds before now
+  const xs = win <= 20 ? 5 : 10;
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = css("--text-muted");
+  for (let s = 0; s <= win; s += xs) {
+    const x = Math.round(X(tEnd - s)) + 0.5;
+    ctx.fillText(s === 0 ? "now" : `−${s} s`, x, PAD.t + ph + 10);
+  }
+  if (!D.t.length) {
+    ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillStyle = css("--text-secondary");
+    ctx.fillText("Waiting for telemetry…", PAD.l + pw / 2, PAD.t + ph / 2);
+    return { X, Y };
+  }
+  const i0 = Math.max(0, lowerBound(D.t, tEnd - win) - 1), i1 = Math.min(D.t.length - 1, lowerBound(D.t, tEnd + 1e-6) - 1);
+  ctx.save(); ctx.beginPath(); ctx.rect(PAD.l, PAD.t - 2, pw, ph + 4); ctx.clip();
+  ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  for (const s of series) {
+    ctx.strokeStyle = css(s.color); ctx.beginPath();
+    for (let i = i0; i <= i1; i++) {
+      const x = X(D.t[i]), y = Y(s.data[i]);
+      if (i === i0) ctx.moveTo(x, y);
+      else if (s.step) { ctx.lineTo(x, Y(s.data[i - 1])); ctx.lineTo(x, y); }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+  // end dots (2px surface ring) + end labels; skip a colliding label rather than stacking
+  const ends = series.map(s => ({ s, y: Y(s.data[i1]), v: s.data[i1] }));
+  const shown = [];
+  for (const e of ends) {
+    const x = X(D.t[i1]);
+    ctx.beginPath(); ctx.arc(x, e.y, 6, 0, 2 * Math.PI); ctx.fillStyle = css("--surface-1"); ctx.fill();
+    ctx.beginPath(); ctx.arc(x, e.y, 4, 0, 2 * Math.PI); ctx.fillStyle = css(e.s.color); ctx.fill();
+    if (shown.some(o => Math.abs(o - e.y) < 15)) continue;
+    shown.push(e.y);
+    ctx.fillStyle = css("--text-primary"); ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.font = "600 13px system-ui, -apple-system, 'Segoe UI', sans-serif";
+    ctx.fillText(`${fmt(e.v)} ${opts.unit}`, x + 10, e.y);
+    ctx.font = "12px system-ui, -apple-system, 'Segoe UI', sans-serif";
+  }
+  // crosshair
+  if (hoverT != null && hoverT >= tEnd - win && hoverT <= tEnd) {
+    const k = nearest(hoverT);
+    const x = Math.round(X(D.t[k])) + 0.5;
+    ctx.strokeStyle = css("--text-muted"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, PAD.t + ph); ctx.stroke();
+    for (const s of series) {
+      const y = Y(s.data[k]);
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fillStyle = css("--surface-1"); ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fillStyle = css(s.color); ctx.fill();
+    }
+  }
+  return { X, Y };
+}
+
+function nearest(t) {
+  const i = lowerBound(D.t, t);
+  if (i <= 0) return 0;
+  if (i >= D.t.length) return D.t.length - 1;
+  return t - D.t[i - 1] < D.t[i] - t ? i - 1 : i;
+}
+
+let lastTable = 0;
+function render() {
+  if (dirty || hoverT != null) {
+    dirty = false;
+    const win = +$("win").value;
+    const tEnd = paused && pausedAt != null ? pausedAt : (D.t.length ? D.t[D.t.length - 1] : win);
+    const i0 = Math.max(0, lowerBound(D.t, tEnd - win)), i1 = Math.max(0, lowerBound(D.t, tEnd + 1e-6) - 1);
+    const has = D.t.length > 0;
+    const yS = has ? range([D.meas, D.tgt], i0, i1, 20) : { lo: 0, hi: 60, step: 20 };
+    const yD = has ? range([D.duty], i0, i1, 20, [-100, 100]) : { lo: 0, hi: 40, step: 10 };
+    drawChart($("c-speed"), [{ data: D.tgt, color: "--series-tgt", step: true }, { data: D.meas, color: "--series-meas" }], yS, tEnd, win, { unit: "RPM" });
+    drawChart($("c-duty"), [{ data: D.duty, color: "--series-duty" }], yD, tEnd, win, { unit: "%" });
+    if (!$("tablecard").hidden && performance.now() - lastTable > 250) { lastTable = performance.now(); fillTable(tEnd); }
+  }
+  requestAnimationFrame(render);
+}
+
+function fillTable(tEnd) {
+  const tb = $("tbody"); tb.textContent = "";
+  let k = lowerBound(D.t, tEnd + 1e-6) - 1, lastT = Infinity;
+  for (let rows = 0; k >= 0 && rows < 25; k--) {
+    if (lastT - D.t[k] < 0.2 - 1e-6) continue;
+    lastT = D.t[k]; rows++;
+    const tr = document.createElement("tr");
+    for (const v of [`−${(tEnd - D.t[k]).toFixed(1)} s`, fmt(D.tgt[k]), fmt(D.meas[k]), fmt(D.duty[k])]) {
+      const td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+// ---- hover + keyboard readout (shared across both charts) ----------------------
+const tip = $("tip");
+function tEndNow() { return paused && pausedAt != null ? pausedAt : (D.t.length ? D.t[D.t.length - 1] : 0); }
+function showTip(k, px, py) {
+  const tEnd = tEndNow();
+  tip.textContent = "";
+  const head = document.createElement("div"); head.className = "t";
+  head.textContent = `${(tEnd - D.t[k]).toFixed(2)} s ago`; tip.appendChild(head);
+  for (const [label, val, unit, color] of [["Measured", D.meas[k], "RPM", "--series-meas"], ["Target", D.tgt[k], "RPM", "--series-tgt"], ["Duty", D.duty[k], "%", "--series-duty"]]) {
+    const row = document.createElement("div"); row.className = "row";
+    const key = document.createElement("b"); key.style.background = `var(${color})`;
+    const strong = document.createElement("strong"); strong.textContent = `${fmt(val)} ${unit}`;
+    const name = document.createElement("span"); name.textContent = label;
+    row.append(key, strong, name); tip.appendChild(row);
+  }
+  tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = px + 16, y = py + 16;
+  if (x + r.width > innerWidth - 8) x = px - r.width - 16;
+  if (y + r.height > innerHeight - 8) y = py - r.height - 16;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+for (const cv of [$("c-speed"), $("c-duty")]) {
+  cv.addEventListener("pointermove", e => {
+    if (!D.t.length) return;
+    const rect = cv.getBoundingClientRect(), win = +$("win").value, tEnd = tEndNow();
+    const pw = rect.width - PAD.l - PAD.r;
+    const t = tEnd - win + (e.clientX - rect.left - PAD.l) / pw * win;
+    if (t < tEnd - win || t > tEnd) { hoverT = null; tip.style.display = "none"; dirty = true; return; }
+    hoverT = t; showTip(nearest(t), e.clientX, e.clientY);
+  });
+  cv.addEventListener("pointerleave", () => { hoverT = null; tip.style.display = "none"; dirty = true; });
+  cv.addEventListener("keydown", e => {
+    if (!D.t.length) return;
+    const win = +$("win").value, tEnd = tEndNow();
+    if (e.key === "Escape") { hoverT = null; tip.style.display = "none"; dirty = true; return; }
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const stepS = e.shiftKey ? 1 : 0.1;
+    hoverT = Math.min(tEnd, Math.max(tEnd - win, (hoverT ?? tEnd) + (e.key === "ArrowRight" ? stepS : -stepS)));
+    const rect = cv.getBoundingClientRect(), pw = rect.width - PAD.l - PAD.r;
+    showTip(nearest(hoverT), rect.left + PAD.l + (hoverT - (tEnd - win)) / win * pw, rect.top + 30);
+  });
+  cv.addEventListener("blur", () => { hoverT = null; tip.style.display = "none"; dirty = true; });
+}
+window.addEventListener("resize", () => { dirty = true; });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { dirty = true; });
+
+connect();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
