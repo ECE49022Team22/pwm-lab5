@@ -55,10 +55,13 @@ So the loop regulates from 10 RPM to 190 RPM in both directions. 190 RPM
 needs ~89% duty; above ~200 RPM there's no duty headroom left to correct
 with, so treat **~190–200 RPM as the closed-loop maximum**.
 
+**Encoder scale verified (2026-10-19).** The motor was driven at 10 RPM and
+stopped by count after 5 × 751.8 = 3,759 counts (it stopped at 3,761). A tape
+flag on the output shaft made exactly 5 turns and ended lined up with its
+reference mark. A 0.3% error in counts per revolution would have left it
+~5° off, so the RPM figures are confirmed against the shaft itself.
+
 Not yet checked:
-- **Encoder scale by hand**: turn the output shaft exactly one revolution
-  with the 12 V off; `cnt` should change by about 752. All RPM figures rely
-  on the 751.8 counts/rev from the spec.
 - **Behavior under load**: rerun `motor_autotune.py` once a load is attached.
 - The duty cap boots at 100% (full range). Lower it with `cap` for gentler bench work.
 
