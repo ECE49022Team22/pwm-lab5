@@ -55,6 +55,7 @@ class Link:
         if self.csv:
             self.csv.writerow(["host_t", "dev_ms", "tgt", "meas", "duty", "cap", "cnt", "flags", "phase"])
         self.phase = ""
+        self.cap = None               # duty cap to restore after clearing the integral
         self.th = threading.Thread(target=self._reader, daemon=True)
         self.th.start()
 
@@ -144,6 +145,12 @@ def wait_stopped(link, limit=4.0):
         if abs(row[0]["meas"]) < 1.0:
             still_since = still_since or now
             if now - still_since >= 0.3:
+                # Firmware built before the "target 0 means off" fix keeps the
+                # integral from the spin-down and holds a few % duty into the
+                # stopped motor. Cycling the cap through 0 clears it.
+                if link.cap is not None:
+                    link.cmd("cap 0")
+                    link.cmd(f"cap {link.cap:g}")
                 return
         else:
             still_since = None
@@ -317,6 +324,7 @@ def verify(link, targets, hold):
               f"duty {s['duty']:+5.1f}%")
         prev = tgt
     link.cmd("0")
+    wait_stopped(link)
     return results
 
 
@@ -370,6 +378,7 @@ def main():
         if first[-1]["t"] is None:
             raise Abort("firmware doesn't send timestamps: flash the build with the 'rate' command")
         cap_before = first[-1]["cap"]
+        link.cap = cap_before
         link.cmd("stop")
         print(f"Connected. Duty cap {cap_before:g}%.")
 

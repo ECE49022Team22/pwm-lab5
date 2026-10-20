@@ -12,22 +12,33 @@ control"); the host console is `motor_pid_uart.py`.
 
 ## 1. Current status
 
-The firmware has been adjusted for the new motor and driver (§3). It builds,
-and the control loop was checked in simulation against a rough model of this
-motor. **It has not run on the new hardware yet.** §7 is the bring-up
-checklist.
+**Running and tuned on the new hardware (unloaded).** `motor_autotune.py`
+measured the motor and picked the gains, which are now the boot defaults.
 
-Simulation result (model plant: ~1.98 RPM per % duty, guessed friction and
-time constant, real encoder quantization and 50 ms speed window):
+Measured (open-loop duty steps, no load, 12 V):
 
-| Gains | Settle to 30 / 60 RPM | Overshoot | Jitter |
-|---|---|---|---|
-| Kp 0.2, Ki 1.0 (boot default) | ~1.3–1.5 s / ~1.0 s | none to ~1 RPM | 1.6 RPM (one count) |
-| Kp 0.3, Ki 2.0 | ~0.7 s / ~0.55 s | up to ~2 RPM if the motor is slow | 1.6 RPM |
+| Quantity | Value |
+|---|---|
+| Speed vs duty | 2.21 RPM per % duty above ~4.1% duty |
+| Delay | ~30 ms (includes the 50 ms speed window) |
+| Time constant | ~34 ms |
+| ±20% duty | +34.4 / −35.1 RPM (symmetric) |
 
-Every combination tried was stable across fast and slow motor models, and
-none tripped the stall fault falsely. The model is a guess; real numbers come
-from bring-up.
+Closed-loop verification with Kp 0.066, Ki 1.97:
+
+| Step | Overshoot | Settle (±5% + 2 RPM) | Steady error | Jitter (sd) | Duty |
+|---|---|---|---|---|---|
+| 0 → 30 RPM | 1.0% | 0.68 s | −0.1 RPM | 0.7 RPM | 17.7% |
+| 30 → 60 RPM | 2.3% | 0.48 s | −0.1 RPM | 0.8 RPM | 31.4% |
+| 60 → −30 RPM | 0.3% | 1.10 s | −0.1 RPM | 0.5 RPM | −17.5% |
+| −30 → 0 RPM | 0% | 0.66 s | 0 | 0 | — |
+
+Not yet checked:
+- **Encoder scale by hand**: turn the output shaft exactly one revolution
+  with the 12 V off; `cnt` should change by about 752. All RPM figures above
+  rely on the 751.8 counts/rev from the spec.
+- **Behavior under load**: rerun `motor_autotune.py` once a load is attached.
+- With the 40% cap, top speed is about (40 − 4.1) × 2.21 ≈ 79 RPM.
 
 ---
 
@@ -82,12 +93,14 @@ supply) are common.
 | PWM | 1 kHz (`MOTOR_PWM_PERIOD` 48000) | **20 kHz** (2400) | The MDD20A handles 20 kHz; inaudible. The 1 kHz was for the slow L298N. |
 | Duty cap boot default | 30% | **40%** | Bench-safety limit, adjustable with `cap` |
 | `MOTOR_DUTY_HARD_MAX` | 35% | **100%** | Old value came from the DRI0002's 2 A rating. The MDD20A limits its own current. |
-| Gains Kp / Ki | 0.6 / 3.0 | **0.2 / 1.0** | ~3× more RPM per % duty (198 vs 67 RPM no-load) |
+| Gains Kp / Ki | 0.6 / 3.0 | **0.066 / 1.97** | Measured and tuned by `motor_autotune.py` (§1). Started from 0.2 / 1.0. |
 | Ramp | 80 RPM/s | **200 RPM/s** | Matches the larger speed range |
 | Encoder pull-ups | always on | **off** (`MOTOR_ENC_PULLUPS` 0) | PA15/PB3 tolerate 5 V only with pull-ups off. Set 1 only for an open-collector encoder. |
-| Encoder direction | — | **`MOTOR_ENC_INVERT`** (default 0) | Set 1 to flip the count (sets TIM2 CC1P) if the rear-mounted encoder reads backwards |
+| Encoder direction | — | **`MOTOR_ENC_INVERT` 1** | The rear-mounted encoder counted backwards (`open 20` read −34 RPM); inverts TI1 (TIM2 CC1P) |
+| Target 0 | integral kept | **output 0, integral cleared once the ramp reaches 0** | The integral built up while slowing held a few % duty into the stopped motor (seen: −4.6% after −30 → 0) |
+| New commands | — | **`kp`/`ki`/`kd <v>`, `rate <hz>`** | Live gains (Ki change keeps the integral term continuous); 1–50 Hz telemetry with ` t=<ms>` off the default 10 Hz |
 
-Unchanged: command set, telemetry format, stall watchdog, reversal dead tick,
+Unchanged: existing commands, telemetry format at the default rate, stall watchdog, reversal dead tick,
 open-loop test, `motor_pid_uart.py`, and the DMA UART from `latency-benchmark`.
 
 ---
@@ -159,14 +172,15 @@ output = Kp·error + Ki·∫error dt + Kd·d(error)/dt      (in % duty)
 
 | Term | What it does | Now |
 |---|---|---|
-| **P** | Pushes in proportion to the current error | `Kp = 0.2` % duty per RPM |
-| **I** | Accumulates error over time until it's gone | `Ki = 1.0` % duty per RPM·s |
+| **P** | Pushes in proportion to the current error | `Kp = 0.066` % duty per RPM |
+| **I** | Accumulates error over time until it's gone | `Ki = 1.97` % duty per RPM·s |
 | **D** | Reacts to how fast the error changes | `Kd = 0` (off) |
 
-**Why the integral term matters.** Holding a speed takes a steady duty: about
-15% for 30 RPM on this motor (198 RPM / 100% ≈ 2 RPM per %, plus friction).
-P alone could only produce 15% by keeping a 15 / 0.2 = 75 RPM error. The
-integral builds that steady duty up so the error can go to zero.
+**Why the integral term matters.** Holding a speed takes a steady duty:
+17.7% for 30 RPM on this motor (measured). P alone could only produce that by
+keeping a 17.7 / 0.066 ≈ 270 RPM error. The integral builds the steady duty
+up so the error can go to zero. With this fast motor (~34 ms time constant)
+the tuned controller is mostly integral: Ki / Kp ≈ 30 per second.
 
 **Anti-windup.** The integral term is clamped to ±cap, so when the output is
 limited it can't store up a correction the motor can't use and then overshoot
@@ -235,6 +249,8 @@ not the GPS logger service (`sudo systemctl stop gps-logger`).
 | `0` or `stop` | Stop; also ends an open-loop test |
 | `open 20`, `open -20` | Open-loop test: fixed duty %, PID and stall watchdog off, auto-stops after 5 s |
 | `cap 60` | Set the duty cap in % (0–100) |
+| `kp 0.07`, `ki 2`, `kd 0` | Set a gain live; reply lists all three. Lost on reset. |
+| `rate 50` | Telemetry 1–50 Hz; adds ` t=<ms>` when not 10 Hz |
 | `reset` | Clear a latched stall fault |
 | `q` | Quit the console |
 
@@ -254,6 +270,7 @@ tgt=30.0 meas=30.3 duty=15.4% cap=40.0% cnt=8123     (values illustrative)
 | `OPEN` | Open-loop test running |
 | `FAULT:STALL` | Stall fault latched; send `reset` |
 | `ORE=n` | UART receive overruns counted (should never appear) |
+| `t` | Device time in ms (only when `rate` isn't 10 Hz) |
 
 ### Emergency stop
 
@@ -284,23 +301,33 @@ bring-up is for.
 
 ---
 
-## 8. Tuning procedure
+## 8. Tuning
 
-Gains are compile-time constants (`mc_Kp`, `mc_Ki`, `mc_Kd` in `src/main.c`);
-changing them means editing and reflashing (12 V off).
+**Automatic:** with 12 V on, motor clamped and nothing else holding the port:
 
-1. Set `Ki = Kd = 0`. Raise `Kp` until the speed oscillates steadily around
-   the target; note that value.
-2. Set `Kp` to 50–60% of it.
-3. Raise `Ki` until steady-state error disappears in reasonable time without
-   bringing back oscillation. Simulation suggests Ki ≈ 2 is reasonable with
-   Kp 0.2–0.3.
-4. Add a little `Kd` only if step changes overshoot too much.
-5. Retune when the load changes.
+```
+python3 motor_autotune.py
+```
+
+1. Direction check: `open ±20` must read ± speed. Aborts otherwise (e.g. set
+   `MOTOR_ENC_INVERT`).
+2. Open-loop duty steps (15%, 30%) fitted to a first-order-plus-delay model.
+3. SIMC PI gains from the model (`--tau-c`, default 0.2 s, sets how fast).
+4. Closed-loop steps 30 → 60 → −30 → 0 RPM, scored; gains scaled ×0.7 if a
+   step overshoots >10%, ×1.3 if settling is slower than 1.2 s, up to 3 rounds.
+
+It aborts on a stall fault, speed far above target, or the wrong direction,
+by sending `cap 0` then `stop` (leaving the cap at 0). Gains it finds are
+live only; it prints the lines to put in `src/main.c`. Every telemetry line
+is logged to a CSV (`--log`).
+
+**Manual:** set gains live with `kp`/`ki`/`kd`. Start with `ki 0`, raise `kp`
+until the speed oscillates, back it off to 50–60%, then raise `ki` until the
+steady-state error goes away without bringing back oscillation.
 
 ---
 
-## 9. History: previous hardware
+## 9. History and bring-up problems
 
 The first version ran a Pololu #2828 (150:1, 9600 counts/rev, 67 RPM no-load)
 through a DFRobot DRI0002 (L298N, 2 A/channel), with a 30% duty cap chosen to
@@ -316,3 +343,10 @@ worth knowing:
    disconnected.
 3. **Driver lost power**: the DRI0002's power LED went out, and the motor and
    the encoder stopped working together. The hardware was replaced afterwards.
+
+On the new hardware:
+
+4. **Encoder counted backwards**: fixed with `MOTOR_ENC_INVERT 1`.
+5. **Reverse worked only sometimes**: the MDD20A's GND wasn't connected to the
+   Nucleo's GND, so DIR1's high level had no reliable reference. Forward
+   (DIR1 low) happened to work. Fixed by adding the ground wire.

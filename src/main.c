@@ -297,18 +297,20 @@ void pwm_uart_loop(void) {
 // MOTOR_ENC_INVERT: set 1 if `open 20` shows negative meas (rear-mounted
 // encoder counts backwards); inverts TI1 polarity, which reverses the count.
 #define MOTOR_ENC_PULLUPS      0
-#define MOTOR_ENC_INVERT       0
+#define MOTOR_ENC_INVERT       1
 
-// Tuning starting point only -- NOT pre-tuned for your mechanical load.
-// This motor gives ~3x the RPM per % duty of the old one (198 vs 67 RPM
-// no-load), so these start at roughly a third of the old 0.6 / 3.0.
+// Tuned by motor_autotune.py on the unloaded PG27 (2026-10-19): measured
+// 2.21 RPM per % duty above ~4% duty, ~30 ms delay (incl. the 50 ms speed
+// window), ~34 ms time constant; SIMC PI for a ~0.2 s closed-loop time
+// constant. Verified 0->30->60->-30->0 RPM: <=2.3% overshoot, settle <=1.1 s,
+// steady error ~0.1 RPM. Retune (rerun the script) after adding load.
 // Bring-up procedure: start with Ki = Kd = 0, raise Kp until you see
 // sustained oscillation at your target RPM, then back Kp off to ~50-60% of
 // that value; raise Ki just enough to kill steady-state RPM error without
 // re-introducing oscillation; add a little Kd only if overshoot on step
 // changes is a problem. Retune (lower Kp especially) if you add real load.
-volatile float mc_Kp = 0.2f;
-volatile float mc_Ki = 1.0f;
+volatile float mc_Kp = 0.066f;
+volatile float mc_Ki = 1.97f;
 volatile float mc_Kd = 0.0f;
 
 volatile float mc_duty_cap_pct = 40.0f;  // boot default for bench safety; up to MOTOR_DUTY_HARD_MAX
@@ -467,6 +469,15 @@ void TIM14_IRQHandler(void) {
         mc_open_ms_left -= (1000 / MOTOR_PID_HZ);
         if (mc_open_ms_left <= 0)
             mc_open_pct = 0.0f;
+    }
+
+    // Target 0 means off once the ramp has reached it. Otherwise the integral
+    // keeps whatever it built up while the motor slowed and, with no error left
+    // to unwind it, holds a few % of duty into a stopped motor indefinitely --
+    // too little to turn it, but amps through a low-resistance RS775.
+    if (!open_loop && mc_target_rpm == 0.0f && mc_ramped_rpm == 0.0f) {
+        output = 0.0f;
+        mc_integral = 0.0f;
     }
 
     if (output > cap)  output = cap;
