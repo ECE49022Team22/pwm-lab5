@@ -10,7 +10,93 @@ control"); the host console is `motor_pid_uart.py`.
 
 ---
 
-## 1. Current status
+## 0a. Calibration with the wheels on (2026-11-04)
+
+Recalibrated after the motors were re-plugged and fitted with wheels on the chassis (wheels off the
+ground, battery power). Both motors and encoders checked first: each motor moves only its own
+encoder, and + duty gives + measured speed on both. On the chassis, **motor 1 = right wheel and its +
+direction rolls the robot backward; motor 2 = left wheel, + rolls it forward** (the demo's
+`--left-motor 2 --left-sign 1 --right-sign -1` defaults; left/right confirmed driving on the floor, where
+speeding up motor 1 turned the robot left).
+
+**Floor driving on tile (same day).** The chassis is skid-steer: two driven 8 in wheels plus two unpowered
+ones that slide sideways in a turn. What we learned (`testing/motor_cal/` (also `~/motor_cal` on the Pi), scripts `robot_drive.py` and `turnmap.py`):
+
+- **Effective track ~0.95 m** (0.88-1.03 m across inner/outer ratios 0.5 to -0.25), against 50 cm between the
+  wheel centres. A kinematic model with that track predicts the turn well; the gyro trims the rest.
+- **Spinning in place stalls** (both motors at 100% duty, stall fault); inner/outer ratio -0.5 stalls too.
+  Tightest clean turn: ratio 0 to -0.25, ~11-12 deg/s, 0.5-0.7 m radius.
+- **Never command a wheel exactly 0 while turning.** The firmware's "target 0 = off" rule then switches the
+  motor off and the inner wheel freewheels (ratio 0 turned 1.3 deg/s that way, 11.7 deg/s with 0.05 RPM).
+  This is also why the first gyro-corrected circle collapsed.
+- **On the floor the wheels need 2-3 s to force a turn**: the outer wheel needs 60-90% duty to drag the
+  chassis round and the inner one gets pulled along while braking. Feedforward (`kf`/`ks`, new, 0 at boot)
+  made little difference: it's torque, not controller lag.
+- **Wheel lift:** the rigid 4-wheel chassis can rock onto a diagonal; a lifted driven wheel ends the turn.
+  Weight over the driven axle or casters would help; `robot_drive.py circle` detects it (wheel well above
+  its command) and recovers with a short slow straight roll.
+- **2 m circle achieved:** `robot_drive.py circle --diameter 2 --side right --speed 0.2` (track 0.95 m
+  feedforward + gyro yaw-rate PI, stops at 360 deg by the gyro): 360 deg in 36 s, radius 1.04 m from wheels
+  and gyro (target 1.00), LiDAR guard at 0.5 m. Looked right to the team.
+- **Left turns are harder than right turns.** In a left circle the right driven wheel is the outer one and
+  it lifts (the chassis rocks off it, even though the robot is heavier on the right). With the plain
+  controller the left circle stalled at 128 deg (6 lift/stuck events). With traction control (`--recover-mode
+  ease`, the default: on a lift, halve the speed difference and ramp it back over 3 s; outer wheel capped at
+  ~10% over the model) it completed 360 deg with one recovery, but slowly: 63 s, ~6 deg/s, radius ~1.5 m by
+  wheel odometry (wheel slip inflates that). Weight over the right driven wheel, or casters/suspension on
+  the unpowered pair, should fix the asymmetry.
+
+Open-loop speed (RPM) vs duty, both wheels:
+
+| Duty | 10% | 20% | 30% | 40% | 50% | 60% | 70% | 80% | 90% | 100% |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Motor 1 fwd | 9.5 | 31.5 | 53.7 | 74.3 | 96.7 | 117.5 | 137.8 | 158.1 | 177.6 | 198.1 |
+| Motor 1 rev | −12.7 | −34.4 | −56.3 | −77.6 | −98.6 | −118.9 | −138.8 | −158.9 | −178.6 | −199.3 |
+| Motor 2 fwd | 10.5 | 31.3 | 53.5 | 73.6 | 95.0 | 114.6 | 136.3 | 155.5 | 174.3 | 194.5 |
+| Motor 2 rev | −11.6 | −32.7 | −54.5 | −75.8 | −96.9 | −117.3 | −137.5 | −157.2 | −176.6 | −196.7 |
+
+~2.1 RPM per % duty, top speed ~195-199 RPM (was 214 bare on the bench supply). `motor_autotune.py`
+(now with `--motor 2`) per motor: motor 1 2.24 RPM/%, 18 ms delay, 50 ms time constant -> **Kp 0.104,
+Ki 2.055**; motor 2 2.18 RPM/%, 22 ms, 43 ms -> **Kp 0.089, Ki 2.062**. These are the boot gains
+(`MOTOR1_BOOT_KP` etc. in `src/main.c`). Verified as robot moves (forward 60/120/160, back 60, spin
+left/right 40): overshoot <=3% (8.5% of a 20 RPM step once), steady error <=0.2 RPM, jitter <=1.1 RPM.
+Keep targets <= ~175 RPM so the PID has duty headroom. Raw logs: `testing/motor_cal/` (also `~/motor_cal` on the Pi).
+
+## 0. Two motors (2026-10-27)
+
+The firmware now runs a second PG27 on MDD20A channel 2 (PWM2 = PA7 / TIM3_CH2, DIR2 = PB2,
+encoder PA8/PA9 on TIM1; see [PWM_PINOUT.md](PWM_PINOUT.md)). Both motors share the 100 Hz PID tick;
+each has its own gains, cap, target, open-loop test and stall fault.
+
+**Protocol.** Unprefixed commands act on motor 1 as before, except `stop` and `reset`, which now act
+on both. `m1 <cmd>` / `m2 <cmd>` send any command to one motor (`m2 40`, `m2 open 20`, `m2 kp 0.07`;
+replies are the same text as motor 1's). `d <rpm1> <rpm2>` sets both targets on the same tick
+(reply `OK target <rpm1> <rpm2> RPM`). Telemetry keeps motor 1's fields first and unchanged, then
+adds ` tgt2= meas2= duty2=% cap2=% cnt2=`; motor 2's flags are lowercase (` open2`, ` stall2`) so a
+search for `OPEN` / `FAULT:STALL` still means motor 1. `motor_live.py` and `motor_autotune.py` still
+work on motor 1 unchanged.
+
+**Motor 2 calibration.** Encoder direction matches with `MOTOR2_ENC_INVERT 1` (same as motor 1), and
+the open-loop curve matches motor 1's within ~2-3%, so it boots with the same gains (Kp 0.066 /
+Ki 1.97):
+
+| Duty | Motor 2 forward | Motor 2 reverse | Motor 1 forward (below) |
+|---|---|---|---|
+| 10% | 13.2 | −15.0 | 12.7 |
+| 20% | 35.9 | −37.4 | 34.9 |
+| 30% | 58.6 | −59.8 | 56.8 |
+| 50% | 104.0 | −104.7 | 101.2 |
+| 70% | 148.6 | −149.3 | 145.6 |
+| 90% | 194.4 | −194.1 | 189.8 |
+
+Closed-loop steps on motor 2 with those gains (0→30→60→120→−60→0 RPM): overshoot ≤2.7%, settle
+≤1.3 s (after the 200 RPM/s ramp), steady error ≤0.1 RPM, jitter ≤1 RPM. Both motors driven together
+with `d` (60/60, 60/−60, −40/80): overshoot ≤1.5%, steady error ≤0.4 RPM on each.
+
+A copy of the single-motor firmware's flash, as it was before this change, is in
+`~/stm32_backups/stm32_flash_backup_before_2motor.bin` (restore: `openocd -f openocd.cfg -c
+"program <file> 0x08000000 verify reset exit"`).
+
 
 **Running and calibrated across the full speed range (unloaded, 12 V).**
 Boot gains Kp 0.066 / Ki 1.97 came from `motor_autotune.py` and were

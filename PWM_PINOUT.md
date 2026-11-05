@@ -29,6 +29,18 @@ same USART5 link as the PC9 demo below.
 | Encoder A (yellow) | PA15 | AF2 (TIM2_CH1) | hardware quadrature decode, 5 V tolerant, no pull-up |
 | Encoder B (green) | PB3 | AF2 (TIM2_CH2) | hardware quadrature decode, 5 V tolerant, no pull-up |
 
+Motor 2 (second PG27, MDD20A channel 2), added 2026-10-27:
+
+| Signal | Pin | Nucleo header | AF | Role |
+|---|---|---|---|---|
+| MDD20A PWM2 | PA7 | D11 / CN10-15 | AF1 (TIM3_CH2) | 20 kHz PWM on the same timer as PWM1 |
+| MDD20A DIR2 | PB2 | CN10-22 (Morpho only) | — (plain GPIO out) | 0 = forward, 1 = reverse |
+| Encoder A | PA8 | D7 / CN9-8 | AF2 (TIM1_CH1) | hardware quadrature decode, 5 V tolerant, no pull-up |
+| Encoder B | PA9 | D8 / CN5-1 | AF2 (TIM1_CH2) | hardware quadrature decode, 5 V tolerant, no pull-up |
+
+TIM1 is 16-bit; the PID tick extends its count to 32 bits in software. (Motor 1's PWM1 is PA6 =
+D12 / CN10-13, next to D11.)
+
 TIM2 runs in encoder mode (`SMS=011`), counting both edges of both channels
 in hardware — no ISR needed just to count pulses. TIM14 (100 Hz) drives the
 PID loop tick; speed is measured over the last 5 ticks (50 ms). There's no

@@ -245,35 +245,45 @@ void pwm_uart_loop(void) {
 }
 
 //============================================================================
-// Closed-loop PID motor speed control
+// Closed-loop PID motor speed control, two motors
 //
-// Hardware: Cytron MDD20A dual 20 A driver (6-30 V), channel 1 only, driven
-// sign-magnitude: PWM1 = speed, DIR1 = direction. PWM low brakes (M1A = M1B
+// Hardware: Cytron MDD20A dual 20 A driver (6-30 V), both channels, driven
+// sign-magnitude: PWMn = speed, DIRn = direction. PWM low brakes (MnA = MnB
 // = low). Accepts 3.3 V logic, PWM up to 20 kHz. No reverse-polarity
 // protection on VB+/VB-.
-// Motor: AndyMark PG27 (am-3651), RS775-125, 12 V, gear ratio 3249/121 =
+// Motors: AndyMark PG27 (am-3651), RS775-125, 12 V, gear ratio 3249/121 =
 // 26.85:1, no-load 198 RPM at the output. Rear-mounted hall encoder, 7 pulses
 // per motor rev per channel, 5 V supply: 7 x 4 edges x 26.85 = 751.8 counts
 // per OUTPUT shaft rev. AndyMark notes the rear mount reverses its count
-// direction relative to a front-mounted encoder (see MOTOR_ENC_INVERT).
+// direction relative to a front-mounted encoder (see MOTORn_ENC_INVERT).
 //
+//   Motor 1 (MDD20A channel 1)
 //   PWM1 -> PA6  -> TIM3_CH1 (AF1), 20 kHz PWM
 //   DIR1 -> PB0  -> plain GPIO output (0 = forward, 1 = reverse)
 //   Encoder A (yellow) -> PA15 -> TIM2_CH1 (AF2), 5 V tolerant
 //   Encoder B (green)  -> PB3  -> TIM2_CH2 (AF2), 5 V tolerant
-//   TIM2 runs in hardware quadrature encoder mode (SMS = 011, counts both
-//   edges of both channels), so no ISR is needed just to count pulses.
+//   Motor 2 (MDD20A channel 2)
+//   PWM2 -> PA7  -> TIM3_CH2 (AF1), 20 kHz PWM (same timer as PWM1)
+//   DIR2 -> PB2  -> plain GPIO output (0 = forward, 1 = reverse)
+//   Encoder A -> PA8 -> TIM1_CH1 (AF2), 5 V tolerant
+//   Encoder B -> PA9 -> TIM1_CH2 (AF2), 5 V tolerant
+//   TIM2 (32-bit) and TIM1 (16-bit, extended to 32 bits in software) run in
+//   hardware quadrature encoder mode (SMS = 011, counts both edges of both
+//   channels), so no ISR is needed just to count pulses.
+//
+// Both motors share one PID tick (TIM14, 100 Hz) and one set of constants;
+// each has its own gains, duty cap, target, open-loop test and stall fault.
 //
 // Safety: there is no current sensing here. Estimated from the specs (198 RPM
 // no-load, 6.3 ft-lbf stall, 26.85:1, lossless gearbox) the RS775-125 has
 // ~0.7 ohm and ~15-20 A stall current at 12 V, within the MDD20A's 20 A
 // rating; the bench supply's ~5 A limit caps it first. Current is bounded by
 // the supply limit and the MDD20A's own current limiting, not by the duty cap.
-// mc_duty_cap_pct boots at 100% (full speed range, ~214 RPM); lower it with
-// `cap` to limit speed/torque. A software stall watchdog force-stops the
+// The duty cap boots at 100% (full speed range, ~214 RPM); lower it with
+// `cap` to limit speed/torque. A software stall watchdog force-stops a
 // motor if it asks for max output while showing ~zero speed for
 // MOTOR_STALL_TIMEOUT_MS, and every direction reversal passes through one
-// tick of zero duty (= brake on the MDD20A) before flipping DIR1.
+// tick of zero duty (= brake on the MDD20A) before flipping DIR.
 //============================================================================
 #include <math.h> // fabsf
 
@@ -293,49 +303,75 @@ void pwm_uart_loop(void) {
 
 // Encoder build switches.
 // MOTOR_ENC_PULLUPS: the encoder pins only tolerate 5 V with the internal
-// pull-ups off, so they're off by default. Set 1 only if the encoder turns
+// pull-ups off, so they're off by default. Set 1 only if the encoders turn
 // out to be open-collector (then the lines idle at 3.3 V via the pull-ups).
-// MOTOR_ENC_INVERT: set 1 if `open 20` shows negative meas (rear-mounted
-// encoder counts backwards); inverts TI1 polarity, which reverses the count.
+// MOTORn_ENC_INVERT: set 1 if `open 20` (`m2 open 20`) shows negative meas
+// (a rear-mounted encoder counts backwards); inverts TI1 polarity, which
+// reverses the count.
 #define MOTOR_ENC_PULLUPS      0
-#define MOTOR_ENC_INVERT       1
+#define MOTOR1_ENC_INVERT      1
+#define MOTOR2_ENC_INVERT      1
 
 // Tuned by motor_autotune.py on the unloaded PG27 (2026-10-19): measured
 // 2.21 RPM per % duty above ~4% duty, ~30 ms delay (incl. the 50 ms speed
 // window), ~34 ms time constant; SIMC PI for a ~0.2 s closed-loop time
 // constant. Verified 0->30->60->-30->0 RPM: <=2.3% overshoot, settle <=1.1 s,
 // steady error ~0.1 RPM. Retune (rerun the script) after adding load.
+// Retuned 2026-11-04 per motor, with the wheels fitted (chassis on a stand, battery
+// power): the wheels slow the response (~45-50 ms time constant, ~20 ms delay)
+// and the speed curve is ~2.1-2.2 RPM per % duty, 195-198 RPM at 100%.
+// Verified 0->30->60->-30->0 RPM on each: overshoot <=6.3% (motor 1, 0->30),
+// settle <=0.61 s after the ramp, steady error <=0.7 RPM.
 // Bring-up procedure: start with Ki = Kd = 0, raise Kp until you see
 // sustained oscillation at your target RPM, then back Kp off to ~50-60% of
 // that value; raise Ki just enough to kill steady-state RPM error without
 // re-introducing oscillation; add a little Kd only if overshoot on step
 // changes is a problem. Retune (lower Kp especially) if you add real load.
-volatile float mc_Kp = 0.066f;
-volatile float mc_Ki = 1.97f;
-volatile float mc_Kd = 0.0f;
-
-volatile float mc_duty_cap_pct = 100.0f; // boot default: full range; lower with `cap`
-volatile float mc_target_rpm = 0.0f;     // set over UART, signed (+ = forward)
-volatile float mc_ramped_rpm = 0.0f;     // soft-start setpoint, updated in the ISR
-volatile float mc_measured_rpm = 0.0f;
-volatile float mc_output_pct = 0.0f;     // last PID output actually applied
-volatile int   mc_fault_stall = 0;       // latched; cleared by a UART command
-volatile int   mc_telemetry_due = 0;     // set every few ticks, printed in main loop
+#define MOTOR1_BOOT_KP         0.104f
+#define MOTOR1_BOOT_KI         2.055f
+#define MOTOR2_BOOT_KP         0.089f
+#define MOTOR2_BOOT_KI         2.062f
+#define MOTOR_BOOT_KD          0.0f
 
 // Open-loop test mode ("open <pct>" over UART): drives a fixed duty with the
 // PID bypassed, for telling a dead drive path apart from a dead encoder. The
 // stall watchdog can't help here (a dead encoder looks like a stall), so the
 // run is time-limited instead and the duty is still clamped to the cap.
 #define MOTOR_OPEN_LOOP_MS     15000
-volatile float mc_open_pct = 0.0f;
-volatile int   mc_open_ms_left = 0;
 
-static float mc_integral = 0.0f;
-static float mc_prev_error = 0.0f;
-static int32_t mc_count_hist[MOTOR_SPEED_WINDOW]; // TIM2->CNT at each of the last WINDOW ticks
-static int mc_hist_i = 0;                // slot written MOTOR_SPEED_WINDOW ticks ago
-static int mc_forward = 1;               // direction currently applied to DIR1
-static uint32_t mc_stall_ms = 0;
+typedef struct {
+    // hardware
+    volatile uint32_t *ccr;              // PWM compare register (TIM3 CCR1 / CCR2)
+    GPIO_TypeDef *dir_port;
+    uint32_t dir_pin;
+    TIM_TypeDef *enc;                    // encoder timer
+    int enc_16bit;                       // TIM1 is 16 bits wide, TIM2 32
+    // shared with the UART loop
+    volatile float Kp, Ki, Kd;
+    volatile float Kf, Ks;               // feedforward: Kf %/RPM x setpoint + Ks % in its direction (0 at boot)
+    volatile float cap_pct;              // boot default: full range; lower with `cap`
+    volatile float target_rpm;           // set over UART, signed (+ = forward)
+    volatile float ramped_rpm;           // soft-start setpoint, updated in the ISR
+    volatile float measured_rpm;
+    volatile float output_pct;           // last PID output actually applied
+    volatile int   fault_stall;          // latched; cleared by a UART command
+    volatile float open_pct;
+    volatile int   open_ms_left;
+    volatile int32_t pos;                // encoder count since boot, 32 bits for both
+    // ISR only
+    float integral;
+    float prev_error;
+    uint16_t last_raw;                   // previous TIM1 count, for the 16-bit extension
+    int32_t count_hist[MOTOR_SPEED_WINDOW]; // pos at each of the last WINDOW ticks
+    int hist_i;                          // slot written MOTOR_SPEED_WINDOW ticks ago
+    int forward;                         // direction currently applied to DIR
+    uint32_t stall_ms;
+} motor_t;
+
+#define MOTOR_COUNT 2
+static motor_t mot[MOTOR_COUNT];
+
+volatile int   mc_telemetry_due = 0;     // set every few ticks, printed in main loop
 static int mc_tick = 0;
 // Telemetry rate, set with `rate <hz>` (1-50). At the default 10 Hz the line
 // format is unchanged; at any other rate a " t=<ms>" timestamp is appended so
@@ -348,45 +384,63 @@ void setup_motor_pwm(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
     RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
 
-    GPIOA->MODER &= ~GPIO_MODER_MODER6;
-    GPIOA->MODER |= GPIO_MODER_MODER6_1;     // AF mode
-    GPIOA->AFR[0] &= ~GPIO_AFRL_AFRL6;
-    GPIOA->AFR[0] |= 0x1 << (6 * 4);         // AF1 = TIM3_CH1
+    GPIOA->MODER &= ~(GPIO_MODER_MODER6 | GPIO_MODER_MODER7);
+    GPIOA->MODER |= GPIO_MODER_MODER6_1 | GPIO_MODER_MODER7_1;   // AF mode
+    GPIOA->AFR[0] &= ~(GPIO_AFRL_AFRL6 | GPIO_AFRL_AFRL7);
+    GPIOA->AFR[0] |= (0x1 << (6 * 4)) | (0x1 << (7 * 4));       // AF1 = TIM3_CH1 / TIM3_CH2
 
     TIM3->PSC = 0;
     TIM3->ARR = MOTOR_PWM_PERIOD - 1;        // 48 MHz / 2400 = 20 kHz
     TIM3->CR1 &= ~TIM_CR1_DIR;
 
-    TIM3->CCMR1 &= ~TIM_CCMR1_OC1M_0;
-    TIM3->CCMR1 |= TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2; // PWM mode 1
+    TIM3->CCMR1 &= ~(TIM_CCMR1_OC1M_0 | TIM_CCMR1_OC2M_0);
+    TIM3->CCMR1 |= TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2       // PWM mode 1 on CH1 and CH2
+                 | TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2;
 
-    TIM3->CCR1 = 0;                          // start at 0% -- motor off
-    TIM3->CCER |= TIM_CCER_CC1E;
+    TIM3->CCR1 = 0;                          // start at 0% -- motors off
+    TIM3->CCR2 = 0;
+    TIM3->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E;
     TIM3->CR1 |= TIM_CR1_CEN;
 }
 
 void setup_motor_dir(void) {
     RCC->AHBENR |= RCC_AHBENR_GPIOBEN;
-    GPIOB->MODER &= ~GPIO_MODER_MODER0;
-    GPIOB->MODER |= GPIO_MODER_MODER0_0;     // general-purpose output
-    GPIOB->BSRR = 1 << (0 + 16);             // start LOW = forward, motor off via CCR1=0
-    mc_forward = 1;
+    GPIOB->MODER &= ~(GPIO_MODER_MODER0 | GPIO_MODER_MODER2);
+    GPIOB->MODER |= GPIO_MODER_MODER0_0 | GPIO_MODER_MODER2_0;   // general-purpose outputs
+    GPIOB->BSRR = (1 << (0 + 16)) | (1 << (2 + 16));            // start LOW = forward, off via CCR=0
 }
 
-void setup_encoder(void) {
+// Quadrature encoder mode on CH1/CH2 of `tim`; the pins are set up by the caller.
+static void encoder_timer_init(TIM_TypeDef *tim, int invert, uint32_t arr) {
+    tim->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
+    tim->CCMR1 |= TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0;  // map CH1/CH2 to TI1/TI2
+    tim->CCMR1 |= (0x3 << 4) | (0x3 << 12);             // light input filter on both
+    tim->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);      // non-inverted
+    if (invert)
+        tim->CCER |= TIM_CCER_CC1P;                     // invert TI1 -> count runs backwards
+    tim->SMCR &= ~TIM_SMCR_SMS;
+    tim->SMCR |= TIM_SMCR_SMS_1 | TIM_SMCR_SMS_0;       // encoder mode 3 (both edges, both ch)
+    tim->ARR = arr;
+    tim->CNT = 0;
+    tim->CR1 |= TIM_CR1_CEN;
+}
+
+void setup_encoders(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
     RCC->AHBENR |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_GPIOBEN;
 
-    // PA15 = TIM2_CH1 (AF2), PB3 = TIM2_CH2 (AF2). Pull-ups off unless
-    // MOTOR_ENC_PULLUPS: the 5 V encoder drives these pins directly.
-    GPIOA->MODER &= ~GPIO_MODER_MODER15;
-    GPIOA->MODER |= GPIO_MODER_MODER15_1;
-    GPIOA->PUPDR &= ~GPIO_PUPDR_PUPDR15;
+    // Motor 1: PA15 = TIM2_CH1 (AF2), PB3 = TIM2_CH2 (AF2).
+    // Motor 2: PA8 = TIM1_CH1 (AF2), PA9 = TIM1_CH2 (AF2).
+    // Pull-ups off unless MOTOR_ENC_PULLUPS: the 5 V encoders drive these pins directly.
+    GPIOA->MODER &= ~(GPIO_MODER_MODER15 | GPIO_MODER_MODER8 | GPIO_MODER_MODER9);
+    GPIOA->MODER |= GPIO_MODER_MODER15_1 | GPIO_MODER_MODER8_1 | GPIO_MODER_MODER9_1;
+    GPIOA->PUPDR &= ~(GPIO_PUPDR_PUPDR15 | GPIO_PUPDR_PUPDR8 | GPIO_PUPDR_PUPDR9);
 #if MOTOR_ENC_PULLUPS
-    GPIOA->PUPDR |= GPIO_PUPDR_PUPDR15_0;
+    GPIOA->PUPDR |= GPIO_PUPDR_PUPDR15_0 | GPIO_PUPDR_PUPDR8_0 | GPIO_PUPDR_PUPDR9_0;
 #endif
-    GPIOA->AFR[1] &= ~GPIO_AFRH_AFRH7;
-    GPIOA->AFR[1] |= 0x2 << 28;              // AF2, pin15 = AFR[1] nibble 7
+    GPIOA->AFR[1] &= ~(GPIO_AFRH_AFRH7 | GPIO_AFRH_AFRH0 | GPIO_AFRH_AFRH1);
+    GPIOA->AFR[1] |= (0x2 << 28) | (0x2 << 0) | (0x2 << 4);  // AF2: pin15 nibble 7, pin8 0, pin9 1
 
     GPIOB->MODER &= ~GPIO_MODER_MODER3;
     GPIOB->MODER |= GPIO_MODER_MODER3_1;
@@ -397,21 +451,23 @@ void setup_encoder(void) {
     GPIOB->AFR[0] &= ~GPIO_AFRL_AFRL3;
     GPIOB->AFR[0] |= 0x2 << 12;              // AF2, pin3 = AFR[0] nibble 3
 
-    TIM2->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
-    TIM2->CCMR1 |= TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0; // map CH1/CH2 to TI1/TI2
-    TIM2->CCMR1 |= (0x3 << 4) | (0x3 << 12);            // light input filter on both
-    TIM2->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);     // non-inverted
-#if MOTOR_ENC_INVERT
-    TIM2->CCER |= TIM_CCER_CC1P;                         // invert TI1 -> count runs backwards
-#endif
-    TIM2->SMCR &= ~TIM_SMCR_SMS;
-    TIM2->SMCR |= TIM_SMCR_SMS_1 | TIM_SMCR_SMS_0;      // encoder mode 3 (both edges, both ch)
-    TIM2->ARR = 0xFFFFFFFF;
-    TIM2->CNT = 0;
-    TIM2->CR1 |= TIM_CR1_CEN;
-    for (int i = 0; i < MOTOR_SPEED_WINDOW; i++)
-        mc_count_hist[i] = 0;
-    mc_hist_i = 0;
+    encoder_timer_init(TIM2, MOTOR1_ENC_INVERT, 0xFFFFFFFF);
+    encoder_timer_init(TIM1, MOTOR2_ENC_INVERT, 0xFFFF);
+}
+
+static void motor_init(motor_t *m, volatile uint32_t *ccr, GPIO_TypeDef *dir_port, uint32_t dir_pin,
+                       TIM_TypeDef *enc, int enc_16bit, float kp, float ki) {
+    memset(m, 0, sizeof *m);
+    m->ccr = ccr;
+    m->dir_port = dir_port;
+    m->dir_pin = dir_pin;
+    m->enc = enc;
+    m->enc_16bit = enc_16bit;
+    m->Kp = kp;
+    m->Ki = ki;
+    m->Kd = MOTOR_BOOT_KD;
+    m->cap_pct = 100.0f;
+    m->forward = 1;
 }
 
 void init_motor_pid_timer(void) {
@@ -424,52 +480,68 @@ void init_motor_pid_timer(void) {
 }
 
 void setup_motor_control(void) {
+    motor_init(&mot[0], &TIM3->CCR1, GPIOB, 0, TIM2, 0, MOTOR1_BOOT_KP, MOTOR1_BOOT_KI);
+    motor_init(&mot[1], &TIM3->CCR2, GPIOB, 2, TIM1, 1, MOTOR2_BOOT_KP, MOTOR2_BOOT_KI);
     setup_motor_pwm();
     setup_motor_dir();
-    setup_encoder();
+    setup_encoders();
     init_motor_pid_timer();
 }
 
-void TIM14_IRQHandler(void) {
-    TIM14->SR &= ~TIM_SR_UIF;
-
+// One PID tick for one motor.
+static void motor_tick(motor_t *m) {
     // --- measure speed from the encoder, over the last MOTOR_SPEED_WINDOW ticks ---
-    int32_t count = (int32_t)TIM2->CNT;
-    int32_t delta = count - mc_count_hist[mc_hist_i];
-    mc_count_hist[mc_hist_i] = count;
-    if (++mc_hist_i >= MOTOR_SPEED_WINDOW)
-        mc_hist_i = 0;
-    mc_measured_rpm = delta * MOTOR_RPM_PER_COUNT;
+    int32_t count;
+    if (m->enc_16bit) {
+        uint16_t raw = (uint16_t)m->enc->CNT;
+        count = m->pos + (int16_t)(uint16_t)(raw - m->last_raw);   // < 32768 counts per tick
+        m->last_raw = raw;
+    } else {
+        count = (int32_t)m->enc->CNT;
+    }
+    m->pos = count;
+    int32_t delta = count - m->count_hist[m->hist_i];
+    m->count_hist[m->hist_i] = count;
+    if (++m->hist_i >= MOTOR_SPEED_WINDOW)
+        m->hist_i = 0;
+    m->measured_rpm = delta * MOTOR_RPM_PER_COUNT;
 
     // --- soft-start: slew the working setpoint toward the commanded one ---
     float max_step = MOTOR_RAMP_RPM_PER_S * MOTOR_PID_DT;
-    float diff = mc_target_rpm - mc_ramped_rpm;
+    float diff = m->target_rpm - m->ramped_rpm;
     if (diff > max_step) diff = max_step;
     if (diff < -max_step) diff = -max_step;
-    mc_ramped_rpm += diff;
+    m->ramped_rpm += diff;
 
     // --- PID ---
-    float cap = mc_duty_cap_pct;
+    float cap = m->cap_pct;
     if (cap > MOTOR_DUTY_HARD_MAX) cap = MOTOR_DUTY_HARD_MAX;
     if (cap < 0.0f) cap = 0.0f;
 
-    float error = mc_ramped_rpm - mc_measured_rpm;
-    mc_integral += error * MOTOR_PID_DT;
-    float i_term = mc_Ki * mc_integral;
-    if (i_term > cap)  { i_term = cap;  mc_integral = (mc_Ki != 0.0f) ? cap / mc_Ki : 0.0f; }
-    if (i_term < -cap) { i_term = -cap; mc_integral = (mc_Ki != 0.0f) ? -cap / mc_Ki : 0.0f; }
-    float derivative = (error - mc_prev_error) / MOTOR_PID_DT;
-    mc_prev_error = error;
+    float Ki = m->Ki;
+    float error = m->ramped_rpm - m->measured_rpm;
+    m->integral += error * MOTOR_PID_DT;
+    float i_term = Ki * m->integral;
+    if (i_term > cap)  { i_term = cap;  m->integral = (Ki != 0.0f) ? cap / Ki : 0.0f; }
+    if (i_term < -cap) { i_term = -cap; m->integral = (Ki != 0.0f) ? -cap / Ki : 0.0f; }
+    float derivative = (error - m->prev_error) / MOTOR_PID_DT;
+    m->prev_error = error;
 
-    float output = mc_Kp * error + i_term + mc_Kd * derivative;
+    // Feedforward (off at boot): the duty the setpoint needs on its own, so the PID only has to
+    // correct the remainder. On the floor the load makes the integral alone take ~2-3 s to build up.
+    float ff = m->Kf * m->ramped_rpm;
+    if (m->ramped_rpm > 0.0f) ff += m->Ks;
+    if (m->ramped_rpm < 0.0f) ff -= m->Ks;
 
-    int open_loop = mc_open_ms_left > 0;
+    float output = m->Kp * error + i_term + m->Kd * derivative + ff;
+
+    int open_loop = m->open_ms_left > 0;
     if (open_loop) {
-        output = mc_open_pct;
-        mc_integral = 0.0f;                  // don't carry windup back into closed loop
-        mc_open_ms_left -= (1000 / MOTOR_PID_HZ);
-        if (mc_open_ms_left <= 0)
-            mc_open_pct = 0.0f;
+        output = m->open_pct;
+        m->integral = 0.0f;                  // don't carry windup back into closed loop
+        m->open_ms_left -= (1000 / MOTOR_PID_HZ);
+        if (m->open_ms_left <= 0)
+            m->open_pct = 0.0f;
     }
 
     // Target 0 means off once the ramp has reached it. Otherwise the integral
@@ -477,48 +549,54 @@ void TIM14_IRQHandler(void) {
     // to unwind it, holds a few % of duty into a stopped motor indefinitely --
     // too little to turn it, but a steady current through the stalled motor
     // (~0.8 A at the 4.6% seen during tuning, at an estimated ~0.7 ohm).
-    if (!open_loop && mc_target_rpm == 0.0f && mc_ramped_rpm == 0.0f) {
+    if (!open_loop && m->target_rpm == 0.0f && m->ramped_rpm == 0.0f) {
         output = 0.0f;
-        mc_integral = 0.0f;
+        m->integral = 0.0f;
     }
 
     if (output > cap)  output = cap;
     if (output < -cap) output = -cap;
-    mc_output_pct = output;
+    m->output_pct = output;
 
     // --- apply to hardware, with a dead tick at 0 duty on every reversal ---
-    if (mc_fault_stall) {
-        TIM3->CCR1 = 0;
+    if (m->fault_stall) {
+        *m->ccr = 0;
     } else {
         int want_forward = (output >= 0.0f);
-        if (want_forward != mc_forward) {
-            TIM3->CCR1 = 0;
-            GPIOB->BSRR = want_forward ? (1 << (0 + 16)) : (1 << 0);
-            mc_forward = want_forward;
+        if (want_forward != m->forward) {
+            *m->ccr = 0;
+            m->dir_port->BSRR = want_forward ? (1 << (m->dir_pin + 16)) : (1 << m->dir_pin);
+            m->forward = want_forward;
         } else {
             float mag = fabsf(output);
-            TIM3->CCR1 = (uint32_t)(mag / 100.0f * MOTOR_PWM_PERIOD + 0.5f);
+            *m->ccr = (uint32_t)(mag / 100.0f * MOTOR_PWM_PERIOD + 0.5f);
         }
     }
 
     // --- stall watchdog: pinned at the cap but not actually turning ---
     // (skipped in open-loop test mode, which is time-limited instead)
-    if (!mc_fault_stall && !open_loop) {
+    if (!m->fault_stall && !open_loop) {
         int pinned = fabsf(output) >= (cap - 1.0f) && cap > 0.0f;
-        int not_moving = fabsf(mc_measured_rpm) < MOTOR_STALL_RPM;
+        int not_moving = fabsf(m->measured_rpm) < MOTOR_STALL_RPM;
         if (pinned && not_moving) {
-            mc_stall_ms += (1000 / MOTOR_PID_HZ);
-            if (mc_stall_ms >= MOTOR_STALL_TIMEOUT_MS) {
-                mc_fault_stall = 1;
-                TIM3->CCR1 = 0;
-                mc_target_rpm = 0.0f;
-                mc_ramped_rpm = 0.0f;
-                mc_integral = 0.0f;
+            m->stall_ms += (1000 / MOTOR_PID_HZ);
+            if (m->stall_ms >= MOTOR_STALL_TIMEOUT_MS) {
+                m->fault_stall = 1;
+                *m->ccr = 0;
+                m->target_rpm = 0.0f;
+                m->ramped_rpm = 0.0f;
+                m->integral = 0.0f;
             }
         } else {
-            mc_stall_ms = 0;
+            m->stall_ms = 0;
         }
     }
+}
+
+void TIM14_IRQHandler(void) {
+    TIM14->SR &= ~TIM_SR_UIF;
+    for (int i = 0; i < MOTOR_COUNT; i++)
+        motor_tick(&mot[i]);
 
     mc_ms += 1000 / MOTOR_PID_HZ;
     if (++mc_tick >= mc_tel_div) {           // 10 Hz by default, see `rate`
@@ -527,33 +605,146 @@ void TIM14_IRQHandler(void) {
     }
 }
 
+// The per-motor commands (see motor_uart_loop). `cmd` is lowercased and trimmed.
+// Replies are the same for either motor, so host tools written for motor 1
+// (motor_autotune.py, motor_live.py) work on motor 2 by prefixing "m2 ".
+static void motor_command(motor_t *m, const char *line) {
+    char reply[64];
+    if (strncmp(line, "reset", 5) == 0) {
+        m->fault_stall = 0;
+        m->stall_ms = 0;
+        uart5_puts("OK fault cleared\r\n");
+        return;
+    }
+    if (strncmp(line, "stop", 4) == 0) {
+        m->open_ms_left = 0;
+        m->open_pct = 0.0f;
+        m->target_rpm = 0.0f;
+        uart5_puts("OK target 0 RPM\r\n");
+        return;
+    }
+    if (strncmp(line, "open", 4) == 0) {
+        char *end;
+        double v = strtod(line + 4, &end);
+        if (end == line + 4 || !(v >= -100.0 && v <= 100.0)) {
+            uart5_puts("ERR need 'open <-100..100>'\r\n");
+            return;
+        }
+        if (m->fault_stall) {
+            uart5_puts("ERR stall fault latched, send 'reset' first\r\n");
+            return;
+        }
+        m->target_rpm = 0.0f;
+        m->ramped_rpm = 0.0f;
+        m->open_pct = (float)v;
+        m->open_ms_left = MOTOR_OPEN_LOOP_MS;
+        snprintf(reply, sizeof reply, "OK open-loop %.1f%% for %d ms (clamped to cap)\r\n",
+                  v, MOTOR_OPEN_LOOP_MS);
+        uart5_puts(reply);
+        return;
+    }
+    if (line[0] == 'k' && (line[1] == 'p' || line[1] == 'i' || line[1] == 'd' || line[1] == 'f' || line[1] == 's')) {
+        char *end;
+        double v = strtod(line + 2, &end);
+        while (*end == ' ' || *end == '\t')
+            end++;
+        if (end == line + 2 || *end != '\0' || !(v >= 0.0 && v <= 100.0)) {
+            uart5_puts("ERR need 'kp|ki|kd|kf|ks <0-100>'\r\n");
+            return;
+        }
+        __disable_irq();                     // don't let the PID tick see a half-applied change
+        if (line[1] == 'p') {
+            m->Kp = (float)v;
+        } else if (line[1] == 'd') {
+            m->Kd = (float)v;
+        } else if (line[1] == 'f') {
+            m->Kf = (float)v;
+        } else if (line[1] == 's') {
+            m->Ks = (float)v;
+        } else {
+            // keep Ki*integral (the integral's share of the output) continuous,
+            // so changing Ki mid-run doesn't kick the output
+            m->integral = (v > 0.0 && m->Ki > 0.0f) ? m->integral * m->Ki / (float)v : 0.0f;
+            m->Ki = (float)v;
+        }
+        __enable_irq();
+        snprintf(reply, sizeof reply, "OK kp=%.4f ki=%.4f kd=%.4f kf=%.4f ks=%.2f\r\n",
+                  (double)m->Kp, (double)m->Ki, (double)m->Kd, (double)m->Kf, (double)m->Ks);
+        uart5_puts(reply);
+        return;
+    }
+    if (strncmp(line, "cap", 3) == 0) {
+        char *end;
+        double v = strtod(line + 3, &end);
+        if (end == line + 3 || !(v >= 0.0 && v <= 100.0)) {
+            uart5_puts("ERR need 'cap <0-100>'\r\n");
+            return;
+        }
+        m->cap_pct = (float)(v > MOTOR_DUTY_HARD_MAX ? MOTOR_DUTY_HARD_MAX : v);
+        snprintf(reply, sizeof reply, "OK cap %.1f%% (hard max %.0f%%)\r\n",
+                  m->cap_pct, (double)MOTOR_DUTY_HARD_MAX);
+        uart5_puts(reply);
+        return;
+    }
+
+    char *end;
+    double rpm = strtod(line, &end);
+    while (*end == ' ' || *end == '\t')
+        end++;
+    if (end == line || *end != '\0') {
+        uart5_puts("ERR unknown command; send a target RPM, 'open <pct>', 'cap <pct>', 'reset', or 'stop'\r\n");
+        return;
+    }
+    m->open_ms_left = 0;                     // a speed command ends any open-loop test
+    m->open_pct = 0.0f;
+    m->target_rpm = (float)rpm;
+    snprintf(reply, sizeof reply, "OK target %.1f RPM\r\n", m->target_rpm);
+    uart5_puts(reply);
+}
+
 // Host UART command loop, reusing uart5_init()/uart5_putc()/uart5_puts()
 // from the PC9 PWM demo above (USART5, PC12=TX/PD2=RX, 115200 8N1).
 //
-// Commands (one per line):
+// Commands (one per line). Without a prefix they act on motor 1, as before
+// motor 2 existed, except `stop` and `reset`, which act on both:
 //   <number>      set target RPM, signed, e.g. "40" or "-40"
 //   cap <number>  set the runtime duty-cycle cap in %, clamped to
 //                 MOTOR_DUTY_HARD_MAX regardless of what's asked for
 //   open <pct>    open-loop test: fixed duty (signed), PID and stall watchdog
 //                 bypassed, auto-stops after MOTOR_OPEN_LOOP_MS
-//   kp|ki|kd <v>  set a PID gain live (0-100); replies with all three
-//   rate <hz>     telemetry rate, 1-50 Hz (adds " t=<ms>" when not 10 Hz)
-//   reset         clear a latched stall fault
-//   stop          equivalent to "0", also ends an open-loop test
+//   kp|ki|kd <v>  set a PID gain live (0-100); replies with all of them
+//   kf|ks <v>     feedforward: kf % duty per RPM of setpoint, ks % duty in the
+//                 setpoint's direction (dead band); both 0 at boot
+//   reset         clear a latched stall fault (both motors)
+//   stop          target 0 on both motors, also ends open-loop tests
+// m1 <cmd> / m2 <cmd>  any command above, for that motor only ("m2 40", "m2 open 20")
+// d <rpm1> <rpm2>      both targets at once (drive command), replies "OK target <rpm1> <rpm2> RPM"
+// rate <hz>            telemetry rate, 1-50 Hz (adds " t=<ms>" when not 10 Hz)
+//
+// Telemetry: motor 1's fields first, unchanged, so motor-1 tools still parse it, then motor 2's:
+//   tgt= meas= duty=% cap=% cnt= tgt2= meas2= duty2=% cap2=% cnt2= [OPEN] [FAULT:STALL]
+//   [open2] [stall2] [ORE=] [t=]
+// (motor 2's flags are lowercase so a search for "OPEN" / "FAULT:STALL" still means motor 1)
 void motor_uart_loop(void) {
     char line[CMD_MAX];
     int n = 0;
-    uart5_puts("Motor PID ready. Send a target RPM, 'open <pct>', 'cap <pct>', 'kp|ki|kd <v>', 'rate <hz>', 'reset', or 'stop'.\r\n");
+    uart5_puts("Motor PID ready (2 motors). Send a target RPM, 'd <rpm1> <rpm2>', 'm2 <cmd>', 'open <pct>', 'cap <pct>', "
+               "'kp|ki|kd <v>', 'rate <hz>', 'reset', or 'stop'.\r\n");
 
     for (;;) {
         if (mc_telemetry_due) {
             mc_telemetry_due = 0;
-            char t[112];
-            snprintf(t, sizeof t, "tgt=%.1f meas=%.1f duty=%.1f%% cap=%.1f%% cnt=%ld%s%s",
-                      mc_target_rpm, mc_measured_rpm, mc_output_pct, mc_duty_cap_pct,
-                      (long)(int32_t)TIM2->CNT,
-                      mc_open_ms_left > 0 ? " OPEN" : "",
-                      mc_fault_stall ? " FAULT:STALL" : "");
+            motor_t *a = &mot[0], *b = &mot[1];
+            char t[128];
+            snprintf(t, sizeof t, "tgt=%.1f meas=%.1f duty=%.1f%% cap=%.1f%% cnt=%ld",
+                      a->target_rpm, a->measured_rpm, a->output_pct, a->cap_pct, (long)a->pos);
+            uart5_puts(t);
+            snprintf(t, sizeof t, " tgt2=%.1f meas2=%.1f duty2=%.1f%% cap2=%.1f%% cnt2=%ld%s%s%s%s",
+                      b->target_rpm, b->measured_rpm, b->output_pct, b->cap_pct, (long)b->pos,
+                      a->open_ms_left > 0 ? " OPEN" : "",
+                      a->fault_stall ? " FAULT:STALL" : "",
+                      b->open_ms_left > 0 ? " open2" : "",
+                      b->fault_stall ? " stall2" : "");
             uart5_puts(t);
             if (u5_overruns) {
                 snprintf(t, sizeof t, " ORE=%lu", (unsigned long)u5_overruns);
@@ -595,65 +786,53 @@ void motor_uart_loop(void) {
             if (*q >= 'A' && *q <= 'Z')
                 *q += 'a' - 'A';
 
-        if (strncmp(line, "reset", 5) == 0) {
-            mc_fault_stall = 0;
-            mc_stall_ms = 0;
-            uart5_puts("OK fault cleared\r\n");
+        if (line[0] == 'm' && (line[1] == '1' || line[1] == '2') && (line[2] == ' ' || line[2] == '\t')) {
+            char *cmd = line + 3;
+            while (*cmd == ' ' || *cmd == '\t')
+                cmd++;
+            motor_command(&mot[line[1] - '1'], cmd);
+            continue;
+        }
+        if (line[0] == 'd' && (line[1] == ' ' || line[1] == '\t')) {
+            char *end1, *end2;
+            double r1 = strtod(line + 2, &end1);
+            double r2 = strtod(end1, &end2);
+            while (*end2 == ' ' || *end2 == '\t')
+                end2++;
+            if (end1 == line + 2 || end2 == end1 || *end2 != '\0' || r1 != r1 || r2 != r2) {
+                uart5_puts("ERR need 'd <rpm1> <rpm2>'\r\n");
+                continue;
+            }
+            __disable_irq();                 // both targets change on the same PID tick
+            for (int i = 0; i < MOTOR_COUNT; i++) {
+                mot[i].open_ms_left = 0;
+                mot[i].open_pct = 0.0f;
+            }
+            mot[0].target_rpm = (float)r1;
+            mot[1].target_rpm = (float)r2;
+            __enable_irq();
+            char reply[48];
+            snprintf(reply, sizeof reply, "OK target %.1f %.1f RPM\r\n", mot[0].target_rpm, mot[1].target_rpm);
+            uart5_puts(reply);
             continue;
         }
         if (strncmp(line, "stop", 4) == 0) {
-            mc_open_ms_left = 0;
-            mc_open_pct = 0.0f;
-            mc_target_rpm = 0.0f;
+            __disable_irq();
+            for (int i = 0; i < MOTOR_COUNT; i++) {
+                mot[i].open_ms_left = 0;
+                mot[i].open_pct = 0.0f;
+                mot[i].target_rpm = 0.0f;
+            }
+            __enable_irq();
             uart5_puts("OK target 0 RPM\r\n");
             continue;
         }
-        if (strncmp(line, "open", 4) == 0) {
-            char *end;
-            double v = strtod(line + 4, &end);
-            if (end == line + 4 || !(v >= -100.0 && v <= 100.0)) {
-                uart5_puts("ERR need 'open <-100..100>'\r\n");
-                continue;
+        if (strncmp(line, "reset", 5) == 0) {
+            for (int i = 0; i < MOTOR_COUNT; i++) {
+                mot[i].fault_stall = 0;
+                mot[i].stall_ms = 0;
             }
-            if (mc_fault_stall) {
-                uart5_puts("ERR stall fault latched, send 'reset' first\r\n");
-                continue;
-            }
-            mc_target_rpm = 0.0f;
-            mc_ramped_rpm = 0.0f;
-            mc_open_pct = (float)v;
-            mc_open_ms_left = MOTOR_OPEN_LOOP_MS;
-            char reply[64];
-            snprintf(reply, sizeof reply, "OK open-loop %.1f%% for %d ms (clamped to cap)\r\n",
-                      v, MOTOR_OPEN_LOOP_MS);
-            uart5_puts(reply);
-            continue;
-        }
-        if (line[0] == 'k' && (line[1] == 'p' || line[1] == 'i' || line[1] == 'd')) {
-            char *end;
-            double v = strtod(line + 2, &end);
-            while (*end == ' ' || *end == '\t')
-                end++;
-            if (end == line + 2 || *end != '\0' || !(v >= 0.0 && v <= 100.0)) {
-                uart5_puts("ERR need 'kp|ki|kd <0-100>'\r\n");
-                continue;
-            }
-            __disable_irq();                 // don't let the PID tick see a half-applied change
-            if (line[1] == 'p') {
-                mc_Kp = (float)v;
-            } else if (line[1] == 'd') {
-                mc_Kd = (float)v;
-            } else {
-                // keep Ki*integral (the integral's share of the output) continuous,
-                // so changing Ki mid-run doesn't kick the output
-                mc_integral = (v > 0.0 && mc_Ki > 0.0f) ? mc_integral * mc_Ki / (float)v : 0.0f;
-                mc_Ki = (float)v;
-            }
-            __enable_irq();
-            char reply[64];
-            snprintf(reply, sizeof reply, "OK kp=%.4f ki=%.4f kd=%.4f\r\n",
-                      (double)mc_Kp, (double)mc_Ki, (double)mc_Kd);
-            uart5_puts(reply);
+            uart5_puts("OK fault cleared\r\n");
             continue;
         }
         if (strncmp(line, "rate", 4) == 0) {
@@ -669,35 +848,7 @@ void motor_uart_loop(void) {
             uart5_puts(reply);
             continue;
         }
-        if (strncmp(line, "cap", 3) == 0) {
-            char *end;
-            double v = strtod(line + 3, &end);
-            if (end == line + 3 || !(v >= 0.0 && v <= 100.0)) {
-                uart5_puts("ERR need 'cap <0-100>'\r\n");
-                continue;
-            }
-            mc_duty_cap_pct = (float)(v > MOTOR_DUTY_HARD_MAX ? MOTOR_DUTY_HARD_MAX : v);
-            char reply[48];
-            snprintf(reply, sizeof reply, "OK cap %.1f%% (hard max %.0f%%)\r\n",
-                      mc_duty_cap_pct, (double)MOTOR_DUTY_HARD_MAX);
-            uart5_puts(reply);
-            continue;
-        }
-
-        char *end;
-        double rpm = strtod(line, &end);
-        while (*end == ' ' || *end == '\t')
-            end++;
-        if (end == line || *end != '\0') {
-            uart5_puts("ERR unknown command; send a target RPM, 'open <pct>', 'cap <pct>', 'reset', or 'stop'\r\n");
-            continue;
-        }
-        mc_open_ms_left = 0;                 // a speed command ends any open-loop test
-        mc_open_pct = 0.0f;
-        mc_target_rpm = (float)rpm;
-        char reply[48];
-        snprintf(reply, sizeof reply, "OK target %.1f RPM\r\n", mc_target_rpm);
-        uart5_puts(reply);
+        motor_command(&mot[0], line);
     }
 }
 
@@ -1068,9 +1219,10 @@ int main(void) {
     // Uncomment only one of MOTOR_PID_DEMO / TEST_UART_PWM / TEST_TIMER3
     // (each loops forever).
 
-    // Closed-loop PID speed control of the AndyMark PG27 gearmotor through
-    // the Cytron MDD20A, channel 1 (PWM1=PA6, DIR1=PB0) with encoder feedback
-    // (A=PA15, B=PB3). Host interface over USART5, see motor_pid_uart.py.
+    // Closed-loop PID speed control of two AndyMark PG27 gearmotors through
+    // the Cytron MDD20A: channel 1 (PWM1=PA6, DIR1=PB0, encoder A=PA15, B=PB3)
+    // and channel 2 (PWM2=PA7, DIR2=PB2, encoder A=PA8, B=PA9). Host interface
+    // over USART5, see motor_pid_uart.py.
 #define MOTOR_PID_DEMO
 #ifdef MOTOR_PID_DEMO
     uart5_init();

@@ -21,6 +21,10 @@ the same. Keep a hand on the 12 V supply switch anyway.
 
 The serial port can only be open in one program at a time: close
 motor_pid_uart.py and `pio device monitor` first.
+
+--motor 2 tunes the second motor: every per-motor command gets the firmware's
+"m2 " prefix and the motor-2 telemetry fields (tgt2/meas2/..., flags open2 /
+stall2) are read instead. The other motor is left at target 0.
 """
 import argparse
 import csv
@@ -36,6 +40,10 @@ import serial
 TEL_RE = re.compile(
     r"tgt=(?P<tgt>-?[\d.]+) meas=(?P<meas>-?[\d.]+) duty=(?P<duty>-?[\d.]+)% "
     r"cap=(?P<cap>-?[\d.]+)% cnt=(?P<cnt>-?\d+)(?P<rest>.*)")
+TEL2_RE = re.compile(
+    r" tgt2=(?P<tgt>-?[\d.]+) meas2=(?P<meas>-?[\d.]+) duty2=(?P<duty>-?[\d.]+)% "
+    r"cap2=(?P<cap>-?[\d.]+)% cnt2=(?P<cnt>-?\d+)")
+GLOBAL_CMDS = ("rate", "stop", "reset")      # act on both motors; never prefixed
 
 
 class Abort(Exception):
@@ -45,7 +53,8 @@ class Abort(Exception):
 class Link:
     """Serial link: a reader thread splits telemetry from command replies."""
 
-    def __init__(self, port, baud, log_path):
+    def __init__(self, port, baud, log_path, motor=1):
+        self.motor = motor
         self.ser = serial.Serial(port, baud, timeout=0.2)
         self.tel = queue.Queue()
         self.replies = queue.Queue()
@@ -75,13 +84,19 @@ class Link:
                 continue
             rest = m.group("rest")
             tm = re.search(r"\bt=(\d+)", rest)
+            open_flag, fault_flag = " OPEN" in rest, "FAULT:STALL" in rest
+            if self.motor == 2:
+                m = TEL2_RE.match(rest)
+                if not m:
+                    raise SystemExit("--motor 2: this firmware sends no motor-2 telemetry")
+                open_flag, fault_flag = " open2" in rest, " stall2" in rest
             row = {
                 "host_t": time.monotonic(),
                 "t": int(tm.group(1)) / 1000.0 if tm else None,
                 "tgt": float(m.group("tgt")), "meas": float(m.group("meas")),
                 "duty": float(m.group("duty")), "cap": float(m.group("cap")),
                 "cnt": int(m.group("cnt")),
-                "open": " OPEN" in rest, "fault": "FAULT:STALL" in rest,
+                "open": open_flag, "fault": fault_flag,
             }
             self.tel.put(row)
             if self.csv:
@@ -94,7 +109,7 @@ class Link:
         """Send one command and return its OK/ERR reply."""
         while not self.replies.empty():
             self.replies.get_nowait()
-        self.ser.write((text + "\n").encode())
+        self.ser.write((self.wire(text) + "\n").encode())
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
@@ -102,6 +117,12 @@ class Link:
         if reply.startswith("ERR"):
             raise Abort(f"'{text}' -> {reply}")
         return reply
+
+    def wire(self, text):
+        """Per-motor commands go to motor 2 with the firmware's "m2 " prefix."""
+        if self.motor == 2 and not text.startswith(GLOBAL_CMDS):
+            return "m2 " + text
+        return text
 
     def drain(self):
         while not self.tel.empty():
@@ -359,6 +380,7 @@ def judge(results, max_over, slow_s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default="/dev/ttyUSB0")
+    ap.add_argument("--motor", type=int, choices=(1, 2), default=1, help="which motor to tune (default 1)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--dir-duty", type=float, default=20, help="duty %% for the direction check")
     ap.add_argument("--id-duties", type=float, nargs=2, default=[15, 30],
@@ -378,7 +400,7 @@ def main():
     a = ap.parse_args()
 
     try:
-        link = Link(a.port, a.baud, a.log)
+        link = Link(a.port, a.baud, a.log, a.motor)
     except serial.SerialException as e:
         sys.exit(f"Could not open {a.port}: {e}")
 
@@ -392,7 +414,7 @@ def main():
         cap_before = first[-1]["cap"]
         link.cap = cap_before
         link.cmd("stop")
-        print(f"Connected. Duty cap {cap_before:g}%.")
+        print(f"Connected to motor {a.motor}. Duty cap {cap_before:g}%.")
 
         print("1. Direction check")
         direction_check(link, a.dir_duty)
@@ -430,14 +452,14 @@ def main():
             print(f"  Kp {kpv:.3f}  Ki {kiv:.3f}: {verdict}, worst overshoot {over:.1f}%, "
                   f"slowest settle after ramp {slowest:.2f} s")
         kp_f, ki_f = history[-1][0], history[-1][1]
-        print(f"\nThese gains are live now and are lost on reset. To keep them, set in src/main.c:\n"
-              f"  volatile float mc_Kp = {kp_f:.3f}f;\n  volatile float mc_Ki = {ki_f:.3f}f;")
+        print(f"\nThese gains are live now on motor {a.motor} and are lost on reset. To keep them, set in "
+              f"src/main.c:\n  #define MOTOR{a.motor}_BOOT_KP {kp_f:.3f}f\n  #define MOTOR{a.motor}_BOOT_KI {ki_f:.3f}f")
     except (Abort, KeyboardInterrupt, StopIteration) as e:
         reason = "interrupted" if isinstance(e, KeyboardInterrupt) else str(e) or "unexpected telemetry"
         print(f"\nABORTED: {reason}")
         for c in ("cap 0", "stop"):
             try:
-                link.ser.write((c + "\n").encode())
+                link.ser.write((link.wire(c) + "\n").encode())
                 time.sleep(0.1)
             except serial.SerialException:
                 pass
