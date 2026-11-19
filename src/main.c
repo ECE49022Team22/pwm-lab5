@@ -737,6 +737,112 @@ static void motor_command(motor_t *m, const char *line) {
 // Host UART command loop, reusing uart5_init()/uart5_putc()/uart5_puts()
 // from the PC9 PWM demo above (host UART: USART2 on PA2/PA3 on the PCB, 115200 8N1).
 //
+// ---------------------------------------------------------------------------
+// Latch servo: standard hobby (PWM) servo on the team PCB's J17.
+// PB10 -> U8 SN74LVC1T45 (A side; DIR = PB11 held high: MCU drives) -> R42 100R -> J17 pin 3, 5 V signal.
+// J17 pin 2 is +12 V (VBAT_SERVO): this 5 V servo is powered separately, not from J17 pin 2.
+// PB10's only timer channel is TIM2_CH3, and TIM2 is motor 1's encoder, so the pulse is made in software
+// from TIM15: the update interrupt (every 20 ms) raises PB10, the CC1 interrupt drops it after the pulse width.
+// TIM15 runs at a higher interrupt priority than the PID tick (TIM14), so the pulse edges don't wait for it.
+// Moves ramp at servo_rate us/s (default ~33 us/s = ~3.3 deg/s): fast moves made the servo jerk (supply sag).
+// No pulses at boot. Positions set 19 Nov 2026 after re-fitting the horn: closed 1700 us (0 deg), open 2000 us
+// (2000 us = 30 deg first, widened to 2050 us; longer pulse = clockwise, ~0.1 deg/us).
+#define SERVO_CLOSED_US    1700
+#define SERVO_OPEN_US      2050     // was 2000; opened ~5 deg more on 19 Nov
+#define SERVO_MIN_US       1000
+#define SERVO_MAX_US       2100
+#define SERVO_RATE_DEFAULT 33       // us per second
+static volatile uint32_t servo_target_us;   // 0 = no pulses
+static volatile uint32_t servo_cur_x16;     // current pulse width, 1/16 us (0 = no pulses)
+static volatile uint32_t servo_last_x16;    // last pulse width sent, so a restart begins where it stopped
+static volatile uint32_t servo_rate = SERVO_RATE_DEFAULT;
+
+void setup_servo(void) {
+    RCC->AHBENR |= RCC_AHBENR_GPIOBEN;
+    RCC->APB2ENR |= RCC_APB2ENR_TIM15EN;
+    GPIOB->BSRR = GPIO_BSRR_BS_11 | GPIO_BSRR_BR_10;                 // U8: MCU drives; signal low
+    GPIOB->MODER = (GPIOB->MODER & ~(GPIO_MODER_MODER10 | GPIO_MODER_MODER11))
+                   | GPIO_MODER_MODER10_0 | GPIO_MODER_MODER11_0;
+    TIM15->PSC = 48 - 1;                     // 1 us ticks
+    TIM15->ARR = 20000 - 1;                  // 20 ms frame, 50 Hz
+    TIM15->CCR1 = 0;
+    TIM15->DIER = TIM_DIER_UIE | TIM_DIER_CC1IE;
+    TIM15->CR1 = TIM_CR1_CEN;
+    NVIC_SetPriority(TIM15_IRQn, 0);
+    NVIC_SetPriority(TIM14_IRQn, 2);
+    NVIC_EnableIRQ(TIM15_IRQn);
+}
+
+void TIM15_IRQHandler(void) {
+    uint32_t sr = TIM15->SR;
+    if (sr & TIM_SR_CC1IF) {                 // end of the pulse
+        TIM15->SR = ~TIM_SR_CC1IF;
+        GPIOB->BSRR = GPIO_BSRR_BR_10;
+    }
+    if (sr & TIM_SR_UIF) {                   // start of a 20 ms frame
+        TIM15->SR = ~TIM_SR_UIF;
+        uint32_t tgt = servo_target_us << 4, cur = servo_cur_x16;
+        if (tgt == 0) {
+            cur = 0;
+        } else {
+            if (cur == 0)
+                cur = servo_last_x16 ? servo_last_x16 : tgt;
+            uint32_t step = (servo_rate * 16u + 25u) / 50u;          // per 20 ms frame
+            if (step == 0) step = 1;
+            if (cur < tgt) cur = (tgt - cur > step) ? cur + step : tgt;
+            else if (cur > tgt) cur = (cur - tgt > step) ? cur - step : tgt;
+        }
+        servo_cur_x16 = cur;
+        if (cur) {
+            servo_last_x16 = cur;
+            TIM15->CCR1 = cur >> 4;
+            GPIOB->BSRR = GPIO_BSRR_BS_10;
+        }
+    }
+}
+
+// "servo" commands, handled by motor_uart_loop:
+//   servo                status: current and target pulse width, rate
+//   servo open | close   ramp to SERVO_OPEN_US / SERVO_CLOSED_US
+//   servo <us>           ramp to a pulse width (SERVO_MIN_US..SERVO_MAX_US); "servo 0" or "servo off" stops pulses
+//   servo rate <us/s>    ramp speed, 1..2000 (default SERVO_RATE_DEFAULT)
+static void servo_command(const char *arg) {
+    char reply[64];
+    while (*arg == ' ' || *arg == '\t')
+        arg++;
+    if (*arg == '\0') {
+        // nothing to change
+    } else if (strncmp(arg, "open", 4) == 0) {
+        servo_target_us = SERVO_OPEN_US;
+    } else if (strncmp(arg, "close", 5) == 0) {
+        servo_target_us = SERVO_CLOSED_US;
+    } else if (strncmp(arg, "off", 3) == 0) {
+        servo_target_us = 0;
+    } else if (strncmp(arg, "rate", 4) == 0) {
+        char *end;
+        long r = strtol(arg + 4, &end, 10);
+        if (end == arg + 4 || r < 1 || r > 2000) {
+            uart5_puts("ERR need 'servo rate <1-2000>' (us/s)\r\n");
+            return;
+        }
+        servo_rate = (uint32_t)r;
+    } else {
+        char *end;
+        long us = strtol(arg, &end, 10);
+        while (*end == ' ' || *end == '\t')
+            end++;
+        if (end == arg || *end != '\0' || (us != 0 && (us < SERVO_MIN_US || us > SERVO_MAX_US))) {
+            snprintf(reply, sizeof reply, "ERR need 'servo open|close|off|<%d-%d>|rate <n>'\r\n", SERVO_MIN_US, SERVO_MAX_US);
+            uart5_puts(reply);
+            return;
+        }
+        servo_target_us = (uint32_t)us;
+    }
+    snprintf(reply, sizeof reply, "OK servo %lu us target %lu rate %lu\r\n",
+             (unsigned long)(servo_cur_x16 >> 4), (unsigned long)servo_target_us, (unsigned long)servo_rate);
+    uart5_puts(reply);
+}
+
 // Commands (one per line). Without a prefix they act on motor 1, as before
 // motor 2 existed, except `stop` and `reset`, which act on both:
 //   <number>      set target RPM, signed, e.g. "40" or "-40"
@@ -752,6 +858,7 @@ static void motor_command(motor_t *m, const char *line) {
 // m1 <cmd> / m2 <cmd>  any command above, for that motor only ("m2 40", "m2 open 20")
 // d <rpm1> <rpm2>      both targets at once (drive command), replies "OK target <rpm1> <rpm2> RPM"
 // rate <hz>            telemetry rate, 1-50 Hz (adds " t=<ms>" when not 10 Hz)
+// servo [open|close|off|<us>|rate <us/s>]  latch servo on J17, see setup_servo(); not affected by stop
 //
 // Telemetry: motor 1's fields first, unchanged, so motor-1 tools still parse it, then motor 2's:
 //   tgt= meas= duty=% cap=% cnt= tgt2= meas2= duty2=% cap2=% cnt2= [OPEN] [FAULT:STALL]
@@ -846,6 +953,10 @@ void motor_uart_loop(void) {
             char reply[48];
             snprintf(reply, sizeof reply, "OK target %.1f %.1f RPM\r\n", mot[0].target_rpm, mot[1].target_rpm);
             uart5_puts(reply);
+            continue;
+        }
+        if (strncmp(line, "servo", 5) == 0 && (line[5] == '\0' || line[5] == ' ' || line[5] == '\t')) {
+            servo_command(line + 5);
             continue;
         }
         if (strncmp(line, "stop", 4) == 0) {
@@ -1259,6 +1370,7 @@ int main(void) {
 #ifdef MOTOR_PID_DEMO
     uart5_init();
     setup_motor_control();
+    setup_servo();
     motor_uart_loop();
 #endif
 
