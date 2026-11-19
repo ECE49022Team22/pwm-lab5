@@ -93,7 +93,20 @@ void setup_tim3(void) {
 //============================================================================
 #define CMD_MAX 24
 
-// USART5 runs on DMA instead of polling RDR/TDR. Not on interrupts: autotest.o already defines
+// Host link. The team PCB (delivery-robot-pcb) wires USART2 to the Pi connector J13:
+// PA2 = USART2_TX -> R12 1k -> J13 pin 2 (to the Pi's RX), PA3 = USART2_RX <- R13 1k <- J13 pin 1 (the Pi's TX).
+// The Nucleo build used USART5 on PC12/PD2 (through an FTDI adapter); define HOST_UART_NUCLEO_USART5 for that.
+#ifdef HOST_UART_NUCLEO_USART5
+#define HOST_UART            USART5
+#define HOST_UART_RCC_EN     RCC_APB1ENR_USART5EN
+#define HOST_DMA_CSELR       (DMA1_CSELR_CH1_USART5_RX | DMA1_CSELR_CH2_USART5_TX)
+#else
+#define HOST_UART            USART2
+#define HOST_UART_RCC_EN     RCC_APB1ENR_USART2EN
+#define HOST_DMA_CSELR       (DMA1_CSELR_CH1_USART2_RX | DMA1_CSELR_CH2_USART2_TX)
+#endif
+
+// The host UART runs on DMA instead of polling RDR/TDR. Not on interrupts: autotest.o already defines
 // USART3_8_IRQHandler (shared by USART3-8). DMA1 ch1 = RX (circular), ch2 = TX (one shot per buffer).
 #define U5_RX_SIZE 128
 #define U5_TX_SIZE 256
@@ -107,21 +120,22 @@ volatile uint32_t u5_overruns;           // ORE events, reported in telemetry if
 static void uart5_dma_init(void) {
     RCC->AHBENR |= RCC_AHBENR_DMA1EN;
     DMA1->CSELR = (DMA1->CSELR & ~(DMA_CSELR_C1S | DMA_CSELR_C2S))
-                  | DMA1_CSELR_CH1_USART5_RX | DMA1_CSELR_CH2_USART5_TX;
+                  | HOST_DMA_CSELR;
 
     DMA1_Channel1->CCR = 0;
-    DMA1_Channel1->CPAR = (uint32_t)&USART5->RDR;
+    DMA1_Channel1->CPAR = (uint32_t)&HOST_UART->RDR;
     DMA1_Channel1->CMAR = (uint32_t)u5_rx;
     DMA1_Channel1->CNDTR = U5_RX_SIZE;
     DMA1_Channel1->CCR = DMA_CCR_MINC | DMA_CCR_CIRC | DMA_CCR_PL_1;   // 8-bit, periph -> mem
     DMA1_Channel1->CCR |= DMA_CCR_EN;
 
     DMA1_Channel2->CCR = 0;
-    DMA1_Channel2->CPAR = (uint32_t)&USART5->TDR;
+    DMA1_Channel2->CPAR = (uint32_t)&HOST_UART->TDR;
     DMA1_Channel2->CCR = DMA_CCR_MINC | DMA_CCR_DIR | DMA_CCR_PL_0;   // 8-bit, mem -> periph
 }
 
 void uart5_init(void) {
+#ifdef HOST_UART_NUCLEO_USART5
     RCC->AHBENR |= RCC_AHBENR_GPIOCEN | RCC_AHBENR_GPIODEN;
 
     // PC12 = USART5_TX, PD2 = USART5_RX, both alternate function 2
@@ -133,16 +147,27 @@ void uart5_init(void) {
     GPIOC->AFR[1] |= 0x2 << 16;
     GPIOD->AFR[0] &= ~GPIO_AFRL_AFRL2;
     GPIOD->AFR[0] |= 0x2 << 8;
+#else
+    RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
 
-    RCC->APB1ENR |= RCC_APB1ENR_USART5EN;
-    USART5->CR1 &= ~USART_CR1_UE;
-    USART5->CR1 &= ~(USART_CR1_M0 | USART_CR1_M1 | USART_CR1_PCE | USART_CR1_OVER8);
-    USART5->CR2 &= ~USART_CR2_STOP;
-    USART5->BRR = 0x1A1; // 48 MHz / 115200 = 417
-    USART5->CR3 |= USART_CR3_DMAR | USART_CR3_DMAT;
-    USART5->CR1 |= USART_CR1_TE | USART_CR1_RE;
-    USART5->CR1 |= USART_CR1_UE;
-    while ((USART5->ISR & (USART_ISR_TEACK | USART_ISR_REACK)) != (USART_ISR_TEACK | USART_ISR_REACK))
+    // PA2 = USART2_TX, PA3 = USART2_RX, both alternate function 1. PA3 gets a pull-up so the RX line
+    // idles high (no stray start bits) while the Pi end is unwired or the Pi is booting.
+    GPIOA->MODER &= ~(GPIO_MODER_MODER2 | GPIO_MODER_MODER3);
+    GPIOA->MODER |= GPIO_MODER_MODER2_1 | GPIO_MODER_MODER3_1;
+    GPIOA->PUPDR = (GPIOA->PUPDR & ~GPIO_PUPDR_PUPDR3) | GPIO_PUPDR_PUPDR3_0;
+    GPIOA->AFR[0] &= ~(GPIO_AFRL_AFRL2 | GPIO_AFRL_AFRL3);
+    GPIOA->AFR[0] |= (0x1 << 8) | (0x1 << 12);
+#endif
+
+    RCC->APB1ENR |= HOST_UART_RCC_EN;
+    HOST_UART->CR1 &= ~USART_CR1_UE;
+    HOST_UART->CR1 &= ~(USART_CR1_M0 | USART_CR1_M1 | USART_CR1_PCE | USART_CR1_OVER8);
+    HOST_UART->CR2 &= ~USART_CR2_STOP;
+    HOST_UART->BRR = 0x1A1; // 48 MHz / 115200 = 417
+    HOST_UART->CR3 |= USART_CR3_DMAR | USART_CR3_DMAT;
+    HOST_UART->CR1 |= USART_CR1_TE | USART_CR1_RE;
+    HOST_UART->CR1 |= USART_CR1_UE;
+    while ((HOST_UART->ISR & (USART_ISR_TEACK | USART_ISR_REACK)) != (USART_ISR_TEACK | USART_ISR_REACK))
         ;
     uart5_dma_init();
 }
@@ -152,8 +177,8 @@ void uart5_init(void) {
 // a blocking print overran RDR and was lost, dropping that command.
 // Returns 1 and stores the next byte in *c, or 0 if nothing is waiting.
 static int uart5_getc(char *c) {
-    if (USART5->ISR & USART_ISR_ORE) {   // can't happen with DMA keeping up; counted in case it does
-        USART5->ICR = USART_ICR_ORECF;
+    if (HOST_UART->ISR & USART_ISR_ORE) {   // can't happen with DMA keeping up; counted in case it does
+        HOST_UART->ICR = USART_ICR_ORECF;
         u5_overruns++;
     }
     uint32_t head = U5_RX_SIZE - DMA1_Channel1->CNDTR;
@@ -309,8 +334,15 @@ void pwm_uart_loop(void) {
 // (a rear-mounted encoder counts backwards); inverts TI1 polarity, which
 // reverses the count.
 #define MOTOR_ENC_PULLUPS      0
+// On the team PCB the encoder A/B order is the other way round from the Nucleo wiring: with TI1 inverted a
+// positive command counted negative on both motors (19 Nov 2026 bring-up), so the inversion is off here.
+#ifdef HOST_UART_NUCLEO_USART5
 #define MOTOR1_ENC_INVERT      1
 #define MOTOR2_ENC_INVERT      1
+#else
+#define MOTOR1_ENC_INVERT      0
+#define MOTOR2_ENC_INVERT      0
+#endif
 
 // Tuned by motor_autotune.py on the unloaded PG27 (2026-10-19): measured
 // 2.21 RPM per % duty above ~4% duty, ~30 ms delay (incl. the 50 ms speed
@@ -703,7 +735,7 @@ static void motor_command(motor_t *m, const char *line) {
 }
 
 // Host UART command loop, reusing uart5_init()/uart5_putc()/uart5_puts()
-// from the PC9 PWM demo above (USART5, PC12=TX/PD2=RX, 115200 8N1).
+// from the PC9 PWM demo above (host UART: USART2 on PA2/PA3 on the PCB, 115200 8N1).
 //
 // Commands (one per line). Without a prefix they act on motor 1, as before
 // motor 2 existed, except `stop` and `reset`, which act on both:
@@ -1222,7 +1254,7 @@ int main(void) {
     // Closed-loop PID speed control of two AndyMark PG27 gearmotors through
     // the Cytron MDD20A: channel 1 (PWM1=PA6, DIR1=PB0, encoder A=PA15, B=PB3)
     // and channel 2 (PWM2=PA7, DIR2=PB2, encoder A=PA8, B=PA9). Host interface
-    // over USART5, see motor_pid_uart.py.
+    // over the host UART (USART2 on the PCB), see motor_pid_uart.py.
 #define MOTOR_PID_DEMO
 #ifdef MOTOR_PID_DEMO
     uart5_init();
