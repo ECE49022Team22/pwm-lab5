@@ -359,11 +359,23 @@ void pwm_uart_loop(void) {
 // that value; raise Ki just enough to kill steady-state RPM error without
 // re-introducing oscillation; add a little Kd only if overshoot on step
 // changes is a problem. Retune (lower Kp especially) if you add real load.
-#define MOTOR1_BOOT_KP         0.104f
-#define MOTOR1_BOOT_KI         2.055f
-#define MOTOR2_BOOT_KP         0.089f
-#define MOTOR2_BOOT_KI         2.062f
+//
+// Ground tuning 20 Nov 2026 (team PCB, robot on its wheels with the rear caster, testing/motor_cal/ground_step.py):
+// open-loop duty steps from rest gave ~0.25-0.34 s time constants (the wheels now accelerate the whole robot, vs
+// 34 ms on the stand), true gains 1.83 (left/motor 2) and 2.41 (right/motor 1) rpm per %, and ~12 % / ~9 % duty
+// lost to friction before the wheels move. So: feedforward for the friction and the rpm (set a little below the
+// from-rest estimates: a rolling wheel needs less), and a stronger PI for what's left. Closed-loop 0->30->60 rpm on
+// the floor: 90 % rise 0.46-0.52 s (was 0.61-0.79), overshoot <= 5.4 rpm (was up to 13.1), straight within 1.5 deg.
+// (Bench values before: motor 1 kp 0.104 ki 2.055, motor 2 kp 0.089 ki 2.062, no feedforward.)
+#define MOTOR1_BOOT_KP         0.40f
+#define MOTOR1_BOOT_KI         1.5f
+#define MOTOR2_BOOT_KP         0.40f
+#define MOTOR2_BOOT_KI         1.5f
 #define MOTOR_BOOT_KD          0.0f
+#define MOTOR1_BOOT_KF         0.29f    // % duty per rpm of setpoint (right wheel)
+#define MOTOR1_BOOT_KS         6.0f     // % duty in the setpoint's direction: friction (right wheel)
+#define MOTOR2_BOOT_KF         0.38f    // left wheel: more friction / load than the right
+#define MOTOR2_BOOT_KS         8.0f
 
 // Open-loop test mode ("open <pct>" over UART): drives a fixed duty with the
 // PID bypassed, for telling a dead drive path apart from a dead encoder. The
@@ -380,7 +392,7 @@ typedef struct {
     int enc_16bit;                       // TIM1 is 16 bits wide, TIM2 32
     // shared with the UART loop
     volatile float Kp, Ki, Kd;
-    volatile float Kf, Ks;               // feedforward: Kf %/RPM x setpoint + Ks % in its direction (0 at boot)
+    volatile float Kf, Ks;               // feedforward: Kf %/RPM x setpoint + Ks % in its direction (MOTORn_BOOT_KF/KS)
     volatile float cap_pct;              // boot default: full range; lower with `cap`
     volatile float target_rpm;           // set over UART, signed (+ = forward)
     volatile float ramped_rpm;           // soft-start setpoint, updated in the ISR
@@ -524,6 +536,8 @@ void init_motor_pid_timer(void) {
 void setup_motor_control(void) {
     motor_init(&mot[0], &TIM3->CCR1, GPIOB, 0, TIM2, 0, MOTOR1_BOOT_KP, MOTOR1_BOOT_KI);
     motor_init(&mot[1], &TIM3->CCR2, GPIOB, 2, TIM1, 1, MOTOR2_BOOT_KP, MOTOR2_BOOT_KI);
+    mot[0].Kf = MOTOR1_BOOT_KF; mot[0].Ks = MOTOR1_BOOT_KS;   // ground-tuned feedforward (see MOTOR1_BOOT_KP)
+    mot[1].Kf = MOTOR2_BOOT_KF; mot[1].Ks = MOTOR2_BOOT_KS;
     setup_motor_pwm();
     setup_motor_dir();
     setup_encoders();
@@ -875,7 +889,7 @@ static void servo_command(const char *arg) {
 //                 bypassed, auto-stops after MOTOR_OPEN_LOOP_MS
 //   kp|ki|kd <v>  set a PID gain live (0-100); replies with all of them
 //   kf|ks <v>     feedforward: kf % duty per RPM of setpoint, ks % duty in the
-//                 setpoint's direction (dead band); both 0 at boot
+//                 setpoint's direction (dead band); boot values MOTORn_BOOT_KF/KS
 //   reset         clear a latched stall fault (both motors)
 //   stop          target 0 on both motors, also ends open-loop tests
 // m1 <cmd> / m2 <cmd>  any command above, for that motor only ("m2 40", "m2 open 20")
@@ -1414,61 +1428,61 @@ int main(void) {
     motor_uart_loop();
 #endif
 
-    // PC9 duty cycle set from the host over USART5 (see pwm_uart.py).
-// #define TEST_UART_PWM
-#ifdef TEST_UART_PWM
-    uart5_init();
-    setup_tim3();
-    pwm_uart_loop();
-#endif
+//     // PC9 duty cycle set from the host over USART5 (see pwm_uart.py).
+// // #define TEST_UART_PWM
+// #ifdef TEST_UART_PWM
+//     uart5_init();
+//     setup_tim3();
+//     pwm_uart_loop();
+// #endif
 
-    // Demonstrate part 1
-// #define TEST_TIMER3
-#ifdef TEST_TIMER3
-    setup_tim3();
-    for(;;) { }
-#endif
+//     // Demonstrate part 1
+// // #define TEST_TIMER3
+// #ifdef TEST_TIMER3
+//     setup_tim3();
+//     for(;;) { }
+// #endif
 
-    // Initialize the display to something interesting to get started.
-    msg[0] |= font['E'];
-    msg[1] |= font['C'];
-    msg[2] |= font['E'];
-    msg[3] |= font[' '];
-    msg[4] |= font['3'];
-    msg[5] |= font['6'];
-    msg[6] |= font['2'];
-    msg[7] |= font[' '];
+//     // Initialize the display to something interesting to get started.
+//     msg[0] |= font['E'];
+//     msg[1] |= font['C'];
+//     msg[2] |= font['E'];
+//     msg[3] |= font[' '];
+//     msg[4] |= font['3'];
+//     msg[5] |= font['6'];
+//     msg[6] |= font['2'];
+//     msg[7] |= font[' '];
 
-    enable_ports();
-    setup_dma();
-    enable_dma();
-    init_tim15();
-    init_tim7();
-    setup_adc();
-    init_tim2();
-    init_wavetable();
-    init_tim6();
+//     enable_ports();
+//     setup_dma();
+//     enable_dma();
+//     init_tim15();
+//     init_tim7();
+//     setup_adc();
+//     init_tim2();
+//     init_wavetable();
+//     init_tim6();
 
-    setup_tim1();
-    setrgb(0x001500);
+//     setup_tim1();
+//     setrgb(0x001500);
 
-    // demonstrate part 2
-#define TEST_TIM1
-#ifdef TEST_TIM1
-    for(;;) {
-        // Breathe in...
-        for(float x=1; x<2400; x *= 1.1) {
-            TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = 2400-x;
-            nano_wait(100000000);
-        }
-        // ...and out...
-        for(float x=2400; x>=1; x /= 1.1) {
-            TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = 2400-x;
-            nano_wait(100000000);
-        }
-        // ...and start over.
-    }
-#endif
+//     // demonstrate part 2
+// #define TEST_TIM1
+// #ifdef TEST_TIM1
+//     for(;;) {
+//         // Breathe in...
+//         for(float x=1; x<2400; x *= 1.1) {
+//             TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = 2400-x;
+//             nano_wait(100000000);
+//         }
+//         // ...and out...
+//         for(float x=2400; x>=1; x /= 1.1) {
+//             TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = 2400-x;
+//             nano_wait(100000000);
+//         }
+//         // ...and start over.
+//     }
+// #endif
 
     // demonstrate part 3
 // #define MIX_TONES
@@ -1498,5 +1512,5 @@ int main(void) {
 // #endif
 
     // Have fun.
-    dialer();
+    // dialer();
 }
