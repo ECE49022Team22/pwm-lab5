@@ -412,6 +412,16 @@ static int mc_tick = 0;
 volatile int mc_tel_div = MOTOR_PID_HZ / 10;  // PID ticks per telemetry line
 volatile uint32_t mc_ms = 0;                  // ms since the PID timer started
 
+// Command watchdog (requirement 4-3). Once a `d` drive command has been received, the motors stop being driven
+// (target 0, output 0 at once: they coast) if no further `d` arrives within cmd_timeout_ms; the next `d` re-arms it.
+// The Pi's control loop sends `d` every 50 ms, so this only fires if the Pi program hangs, dies or loses the link.
+// `timeout <ms>` changes it (0 = off). Bench tools that only send bare targets (motor_live.py) never arm it.
+#define CMD_TIMEOUT_MS_DEFAULT 400
+volatile uint32_t cmd_timeout_ms = CMD_TIMEOUT_MS_DEFAULT;
+volatile uint32_t cmd_age_ms = 0;
+volatile int cmd_armed = 0;                   // a `d` command has been seen since boot
+volatile int cmd_timed_out = 0;               // the watchdog stopped the motors (" WD" in telemetry) until the next `d`
+
 void setup_motor_pwm(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
     RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
@@ -627,6 +637,19 @@ static void motor_tick(motor_t *m) {
 
 void TIM14_IRQHandler(void) {
     TIM14->SR &= ~TIM_SR_UIF;
+    if (cmd_armed && cmd_timeout_ms) {           // command watchdog, see cmd_timeout_ms
+        if (cmd_age_ms < cmd_timeout_ms) {
+            cmd_age_ms += 1000 / MOTOR_PID_HZ;
+        } else if (!cmd_timed_out) {
+            cmd_timed_out = 1;
+            for (int i = 0; i < MOTOR_COUNT; i++) {
+                if (mot[i].open_ms_left > 0)     // an open-loop test has its own time limit
+                    continue;
+                mot[i].target_rpm = 0.0f;
+                mot[i].ramped_rpm = 0.0f;        // no ramp-down: motor_tick sets the output to 0 on this tick
+            }
+        }
+    }
     for (int i = 0; i < MOTOR_COUNT; i++)
         motor_tick(&mot[i]);
 
@@ -859,10 +882,11 @@ static void servo_command(const char *arg) {
 // d <rpm1> <rpm2>      both targets at once (drive command), replies "OK target <rpm1> <rpm2> RPM"
 // rate <hz>            telemetry rate, 1-50 Hz (adds " t=<ms>" when not 10 Hz)
 // servo [open|close|off|<us>|rate <us/s>]  latch servo on J17, see setup_servo(); not affected by stop
+// timeout <ms>         command watchdog: after the first `d`, no `d` for this long -> both targets 0 (default 400, 0 = off)
 //
 // Telemetry: motor 1's fields first, unchanged, so motor-1 tools still parse it, then motor 2's:
 //   tgt= meas= duty=% cap=% cnt= tgt2= meas2= duty2=% cap2=% cnt2= [OPEN] [FAULT:STALL]
-//   [open2] [stall2] [ORE=] [t=]
+//   [open2] [stall2] [WD] [ORE=] [t=]      (WD: the command watchdog stopped the motors)
 // (motor 2's flags are lowercase so a search for "OPEN" / "FAULT:STALL" still means motor 1)
 void motor_uart_loop(void) {
     char line[CMD_MAX];
@@ -878,12 +902,13 @@ void motor_uart_loop(void) {
             snprintf(t, sizeof t, "tgt=%.1f meas=%.1f duty=%.1f%% cap=%.1f%% cnt=%ld",
                       a->target_rpm, a->measured_rpm, a->output_pct, a->cap_pct, (long)a->pos);
             uart5_puts(t);
-            snprintf(t, sizeof t, " tgt2=%.1f meas2=%.1f duty2=%.1f%% cap2=%.1f%% cnt2=%ld%s%s%s%s",
+            snprintf(t, sizeof t, " tgt2=%.1f meas2=%.1f duty2=%.1f%% cap2=%.1f%% cnt2=%ld%s%s%s%s%s",
                       b->target_rpm, b->measured_rpm, b->output_pct, b->cap_pct, (long)b->pos,
                       a->open_ms_left > 0 ? " OPEN" : "",
                       a->fault_stall ? " FAULT:STALL" : "",
                       b->open_ms_left > 0 ? " open2" : "",
-                      b->fault_stall ? " stall2" : "");
+                      b->fault_stall ? " stall2" : "",
+                      cmd_timed_out ? " WD" : "");
             uart5_puts(t);
             if (u5_overruns) {
                 snprintf(t, sizeof t, " ORE=%lu", (unsigned long)u5_overruns);
@@ -949,9 +974,24 @@ void motor_uart_loop(void) {
             }
             mot[0].target_rpm = (float)r1;
             mot[1].target_rpm = (float)r2;
+            cmd_age_ms = 0;                  // feed the command watchdog
+            cmd_armed = 1;
+            cmd_timed_out = 0;
             __enable_irq();
             char reply[48];
             snprintf(reply, sizeof reply, "OK target %.1f %.1f RPM\r\n", mot[0].target_rpm, mot[1].target_rpm);
+            uart5_puts(reply);
+            continue;
+        }
+        if (strncmp(line, "timeout", 7) == 0 && (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
+            char *end;
+            long v = strtol(line + 7, &end, 10);
+            if (end != line + 7 && v >= 0 && v <= 60000) {
+                cmd_timeout_ms = (uint32_t)v;
+                cmd_age_ms = 0;
+            }
+            char reply[48];
+            snprintf(reply, sizeof reply, "OK timeout %lu ms\r\n", (unsigned long)cmd_timeout_ms);
             uart5_puts(reply);
             continue;
         }
